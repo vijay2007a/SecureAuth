@@ -40,6 +40,7 @@ from .models import (
     UserProfile,
     utc_now,
 )
+from .firebase_init import init_firebase_app
 from .security import get_current_user, require_roles, verify_firebase_token
 from .store import BaseStore, FirestoreStore, MemoryStore
 
@@ -290,7 +291,8 @@ def create_app(store: BaseStore | None = None) -> FastAPI:
     manager = ConnectionManager()
 
     app = FastAPI(title="SecureAuth Lab API", version="1.0.0")
-    origins = [origin.strip() for origin in os.getenv("CORS_ORIGINS", "http://127.0.0.1:5173,http://localhost:5173").split(",") if origin.strip()]
+    _cors_default = "http://127.0.0.1:5173,http://localhost:5173,https://secure-auth-gamma-jet.vercel.app"
+    origins = [origin.strip() for origin in os.getenv("CORS_ORIGINS", _cors_default).split(",") if origin.strip()]
     app.add_middleware(
         CORSMiddleware,
         allow_origins=origins,
@@ -808,6 +810,21 @@ def create_app(store: BaseStore | None = None) -> FastAPI:
 
     @app.on_event("startup")
     async def _startup() -> None:
+        # Eagerly initialise Firebase Admin SDK when running in firebase mode.
+        # This guarantees the SDK is ready before the first WebSocket connection
+        # arrives — avoiding the race where AUTH_MODE=firebase + USE_FIRESTORE=false
+        # left firebase_admin._apps empty and caused every WS handshake to 503→403.
+        if os.getenv("AUTH_MODE", "dev").lower() == "firebase":
+            try:
+                init_firebase_app()
+            except Exception:
+                import logging
+                logging.getLogger(__name__).exception(
+                    "Firebase Admin SDK failed to initialise at startup — "
+                    "check FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, "
+                    "and FIREBASE_PRIVATE_KEY environment variables."
+                )
+
         if not store.list_models():
             for model in _default_metrics():
                 store.upsert_model(model)

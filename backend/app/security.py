@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from typing import Callable
 
@@ -7,6 +8,8 @@ from fastapi import Depends, Header, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from .models import AuthenticatedUser, Role
+
+logger = logging.getLogger(__name__)
 
 bearer_scheme = HTTPBearer(auto_error=False)
 
@@ -40,25 +43,67 @@ def _dev_user_from_token(token: str) -> AuthenticatedUser | None:
 
 def verify_firebase_token(token: str) -> AuthenticatedUser:
     auth_mode = os.getenv("AUTH_MODE", "dev").lower()
+
+    # ── Development fallback ──────────────────────────────────────────────────
     if auth_mode == "dev":
         user = _dev_user_from_token(token)
         if user:
             return user
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid development token")
 
+    # ── Firebase path ─────────────────────────────────────────────────────────
     try:
         import firebase_admin
         from firebase_admin import auth as firebase_auth
-    except Exception as exc:  # pragma: no cover - production dependency issue
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Firebase auth unavailable") from exc
+    except ImportError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Firebase auth package is not installed",
+        ) from exc
 
+    # Ensure the SDK is initialised regardless of whether Firestore is in use.
+    # This fixes the bug where AUTH_MODE=firebase + USE_FIRESTORE=false left
+    # firebase_admin._apps empty, causing every token to be rejected with 503
+    # which the WebSocket handler turned into a 403.
     if not firebase_admin._apps:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Firebase admin is not configured")
+        try:
+            from .firebase_init import init_firebase_app
+            init_firebase_app()
+        except Exception as exc:
+            logger.exception("Firebase Admin initialisation failed")
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Firebase Admin SDK could not be initialised. "
+                       "Check FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, "
+                       "and FIREBASE_PRIVATE_KEY on the server.",
+            ) from exc
+
+    # Verify the ID token supplied by the client.
     try:
         decoded = firebase_auth.verify_id_token(token)
+    except firebase_auth.ExpiredIdTokenError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Firebase ID token has expired — please sign in again.",
+        ) from exc
+    except firebase_auth.InvalidIdTokenError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid Firebase ID token.",
+        ) from exc
     except Exception as exc:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Firebase token") from exc
-    role = Role(decoded.get("role", Role.user.value))
+        logger.warning("Firebase token verification failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Firebase token verification failed.",
+        ) from exc
+
+    role_value = decoded.get("role", Role.user.value)
+    try:
+        role = Role(role_value)
+    except ValueError:
+        role = Role.user
+
     return AuthenticatedUser(
         id=decoded.get("uid") or decoded.get("user_id"),
         email=decoded.get("email", ""),
@@ -81,4 +126,3 @@ def require_roles(*roles: Role) -> Callable[[AuthenticatedUser], AuthenticatedUs
         return user
 
     return _dependency
-

@@ -2544,8 +2544,17 @@ export default function App() {
     if (!shouldConnect) return;
     let reconnectTimer: number | null = null;
     let closed = false;
-    const connect = () => {
-      const token = getAccessToken();
+    const connect = async () => {
+      // Obtain a fresh ID token on every connect attempt.
+      // user.getIdToken(false) lets the Firebase SDK auto-refresh silently
+      // if the token is within 5 min of expiry, preventing 401s after 1 hour.
+      let token: string;
+      if (currentUser && isFirebaseConfigured) {
+        token = await currentUser.getIdToken(false).catch(() => getAccessToken());
+        setAccessToken(token); // keep session cache in sync
+      } else {
+        token = getAccessToken();
+      }
       if (!token) return;
       const socket = new WebSocket(wsUrl(`/ws/live?token=${encodeURIComponent(token)}`));
       wsRef.current = socket;

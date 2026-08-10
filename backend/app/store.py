@@ -325,34 +325,13 @@ class MemoryStore(BaseStore):
 
 class FirestoreStore(BaseStore):
     def __init__(self, project_id: str | None = None) -> None:
-        import firebase_admin
-        from firebase_admin import credentials, firestore
+        # Delegate all credential resolution and SDK initialisation to the
+        # shared firebase_init module so the logic is never duplicated.
+        from .firebase_init import init_firebase_app
+        from firebase_admin import firestore
 
         self._project_id = project_id
-        if not firebase_admin._apps:
-            cred_path = None
-            import os
-
-            if os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
-                cred_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-            elif os.getenv("FIREBASE_PRIVATE_KEY") and os.getenv("FIREBASE_CLIENT_EMAIL"):
-                key = os.getenv("FIREBASE_PRIVATE_KEY", "").replace("\\n", "\n")
-                cred = credentials.Certificate(
-                    {
-                        "type": "service_account",
-                        "project_id": project_id,
-                        "private_key_id": os.getenv("FIREBASE_PRIVATE_KEY_ID", "local"),
-                        "private_key": key,
-                        "client_email": os.getenv("FIREBASE_CLIENT_EMAIL"),
-                        "client_id": os.getenv("FIREBASE_CLIENT_ID", "local"),
-                        "token_uri": "https://oauth2.googleapis.com/token",
-                    }
-                )
-                firebase_admin.initialize_app(cred, {"projectId": project_id})
-            elif cred_path:
-                firebase_admin.initialize_app(credentials.Certificate(cred_path), {"projectId": project_id})
-            else:
-                firebase_admin.initialize_app()
+        init_firebase_app()
         self._db = firestore.client()
 
     def _col(self, name: str):
