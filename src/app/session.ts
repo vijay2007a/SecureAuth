@@ -1,0 +1,12 @@
+let accessToken = "";
+
+export const setAccessToken = (token: string) => {
+  accessToken = token;
+};
+
+export const getAccessToken = () => accessToken;
+
+export const clearAccessToken = () => {
+  accessToken = "";
+};
+
