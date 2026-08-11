@@ -2529,7 +2529,9 @@ export default function App() {
     const unsubscribe = onAuthStateChanged(auth, async user => {
       setCurrentUser(user);
       if (user) {
-        const token = await user.getIdToken().catch(() => "");
+        // Force a fresh ID token so newly assigned Firebase custom claims
+        // (for example `role: "admin"`) are included immediately after sign-in.
+        const token = await user.getIdToken(true).catch(() => "");
         setAccessToken(token);
       } else {
         clearAccessToken();
