@@ -1382,10 +1382,10 @@ const CredentialStuffingScreen = () => {
             <p className="font-semibold text-slate-700 text-sm mb-3">Configuration Summary</p>
             <div className="space-y-2.5">
               {[
-                { label: "Credential File", value: fileName },
+                { label: "Credential Dataset", value: datasetMeta ? datasetMeta.filename : "Default Generator" },
                 { label: "Max Attempts", value: maxAttempts },
                 { label: "Concurrency", value: `${concurrency} threads` },
-                { label: "Est. Duration", value: `~${Math.max(1, Math.round(parseInt(maxAttempts || "500") / parseInt(concurrency || "10") * 0.5 / 60))} min` },
+                { label: "Est. Duration", value: `~${Math.max(1, Math.round((parseInt(maxAttempts || "500", 10) / Math.max(1, parseInt(concurrency || "10", 10))) * 0.5 / 60))} min` },
               ].map(s => (
                 <div key={s.label} className="flex justify-between text-sm border-b border-slate-50 pb-2 last:border-0">
                   <span className="text-slate-500">{s.label}</span>
@@ -3022,7 +3022,9 @@ export default function App() {
       <div className="flex-1 flex flex-col overflow-hidden min-w-0">
         <TopBar onNav={setScreen} currentUser={currentUser} onLogout={handleLogout} wsStatus={wsStatus} unreadAlertsCount={unreadAlertsCount} />
         <main className="flex-1 overflow-y-auto p-6 min-w-0">
-          {renderScreen()}
+          <ErrorBoundary key={screen}>
+            {renderScreen()}
+          </ErrorBoundary>
         </main>
       </div>
     </div>
