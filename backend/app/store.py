@@ -205,12 +205,12 @@ class MemoryStore(BaseStore):
             type="Rule-Based",
             status="active",
             version="v2.1.0",
-            accuracy=94.2,
-            detections=1420,
-            false_positives=18,
-            training_samples=256,
+            accuracy=None,
+            detections=0,
+            false_positives=0,
+            training_samples=0,
             last_trained_at=utc_now(),
-            notes="Primary detector",
+            notes="Primary heuristic engine",
         )
         self._models["random-forest"] = ModelMetric(
             id="random-forest",
@@ -228,20 +228,22 @@ class MemoryStore(BaseStore):
             id="isolation-forest",
             name="IsolationForest Anomaly Detector",
             type="Anomaly",
-            status="training",
+            status="inactive",
             version="v1.0.0",
             accuracy=None,
             detections=0,
             false_positives=0,
             training_samples=0,
-            notes="Awaiting more event history",
+            notes="Awaiting event history",
         )
         self._reports["weekly"] = ReportRecord(
             id="weekly",
-            name="Weekly Attack Summary",
-            type="Summary",
-            size_bytes=2_400_000,
-            content={"summary": "Seeded report"},
+            name="Weekly Authentication Threat Report",
+            type="Threat Summary",
+            generated_at=utc_now(),
+            size_bytes=1024 * 1024 * 2,
+            status="ready",
+            file_url="/reports/weekly.pdf",
         )
 
     def get_user_profile(self, user_id: str) -> Optional[UserProfile]:
@@ -249,32 +251,32 @@ class MemoryStore(BaseStore):
 
     def upsert_user_profile(self, profile: UserProfile) -> UserProfile:
         with self._lock:
-            profile.updated_at = utc_now()
             self._users[profile.id] = profile
         return profile
 
     def list_accounts(self) -> list[TestAccount]:
-        return sorted(self._accounts.values(), key=lambda item: item.created_at)
+        return sorted(self._accounts.values(), key=lambda item: item.username)
 
     def upsert_account(self, account: TestAccount) -> TestAccount:
         with self._lock:
-            account.updated_at = utc_now()
             self._accounts[account.id] = account
         return account
 
     def get_account(self, account_id: str) -> Optional[TestAccount]:
         return self._accounts.get(account_id)
 
-    def delete_account(self, account_id: str) -> None:
+    def delete_account(self, account_id: str) -> bool:
         with self._lock:
-            self._accounts.pop(account_id, None)
+            if account_id in self._accounts:
+                del self._accounts[account_id]
+                return True
+            return False
 
     def list_ips(self) -> list[IPControl]:
-        return sorted(self._ips.values(), key=lambda item: item.created_at)
+        return sorted(self._ips.values(), key=lambda item: item.ip)
 
     def upsert_ip(self, control: IPControl) -> IPControl:
         with self._lock:
-            control.updated_at = utc_now()
             self._ips[control.id] = control
         return control
 
@@ -319,20 +321,14 @@ class MemoryStore(BaseStore):
         with self._lock:
             existing_key = next(
                 (
-                    key
-                    for key, value in self._notification_tokens.items()
+                    item_id
+                    for item_id, value in self._notification_tokens.items()
                     if value.uid == token.uid and value.token == token.token
                 ),
                 None,
             )
-            token.updated_at = utc_now()
-            token.last_seen_at = token.updated_at
-            if existing_key:
-                token.id = self._notification_tokens[existing_key].id
-                token.created_at = self._notification_tokens[existing_key].created_at
-                self._notification_tokens[existing_key] = token
-            else:
-                self._notification_tokens[token.id] = token
+            key = existing_key or token.id
+            self._notification_tokens[key] = token
         return token
 
     def delete_notification_token(self, uid: str, token: str) -> bool:
@@ -481,8 +477,9 @@ class FirestoreStore(BaseStore):
         payload = self._doc("test_accounts", account_id)
         return TestAccount(**payload) if payload else None
 
-    def delete_account(self, account_id: str) -> None:
+    def delete_account(self, account_id: str) -> bool:
         self._col("test_accounts").document(account_id).delete()
+        return True
 
     def list_ips(self) -> list[IPControl]:
         return self._all("ip_controls", IPControl)
@@ -495,8 +492,17 @@ class FirestoreStore(BaseStore):
         payload = self._doc("ip_controls", ip_id)
         return IPControl(**payload) if payload else None
 
+    def find_ip(self, ip: str) -> Optional[IPControl]:
+        docs = self._col("ip_controls").where("ip", "==", ip).limit(1).get()
+        for doc in docs:
+            payload = doc.to_dict() or {}
+            payload["id"] = doc.id
+            return IPControl(**payload)
+        return None
+
     def list_events(self) -> list[LoginEvent]:
-        return self._all("login_events", LoginEvent)
+        items = self._all("login_events", LoginEvent)
+        return sorted(items, key=lambda x: x.timestamp, reverse=True)
 
     def add_event(self, event: LoginEvent) -> LoginEvent:
         self._col("login_events").document(event.id).set(self._dump(event))

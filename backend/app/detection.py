@@ -92,7 +92,12 @@ def make_features(events: list[LoginEvent], current: LoginEvent) -> dict[str, fl
     }
 
 
-def _score_rules(events: list[LoginEvent], current: LoginEvent, thresholds: Thresholds) -> tuple[int, dict[str, bool], str]:
+def _score_rules(
+    events: list[LoginEvent],
+    current: LoginEvent,
+    thresholds: Thresholds,
+    blocked_ips: set[str] | None = None,
+) -> tuple[int, dict[str, bool], str]:
     same_ip = [event for event in events if event.source_ip == current.source_ip]
     same_account = [event for event in events if event.username == current.username]
     failures_same_ip = [event for event in same_ip if not event.success]
@@ -101,7 +106,7 @@ def _score_rules(events: list[LoginEvent], current: LoginEvent, thresholds: Thre
     unique_passwords = len({event.password_ref for event in same_ip})
     high_attempt_window = len([event for event in same_ip if (current.timestamp - event.timestamp).total_seconds() <= 300])
     failure_ratio = len(failures_same_ip) / max(1, len(same_ip))
-    blocked_ip = False
+    blocked_ip = current.source_ip in (blocked_ips or set())
 
     rules = {
         "password_spray": unique_accounts >= thresholds.password_spray_unique_accounts and unique_passwords <= 2,
@@ -135,7 +140,7 @@ def _score_rules(events: list[LoginEvent], current: LoginEvent, thresholds: Thre
         explanation_parts.append("a success followed repeated failures")
     if blocked_ip:
         score += thresholds.blocked_ip_risk_bonus
-        explanation_parts.append("the source IP is blocked")
+        explanation_parts.append("the source IP is blocked by IP Controls")
 
     score = min(100, score)
     explanation = "; ".join(explanation_parts) if explanation_parts else "activity is within normal bounds"
@@ -174,8 +179,13 @@ class ModelBundle:
 MODEL_BUNDLE = ModelBundle()
 
 
-def analyze_event(events: list[LoginEvent], current: LoginEvent, thresholds: Thresholds) -> tuple[int, Severity, float, AttackType, DetectionMethod, str, bool, dict[str, bool], dict[str, float]]:
-    score, rules, explanation = _score_rules(events, current, thresholds)
+def analyze_event(
+    events: list[LoginEvent],
+    current: LoginEvent,
+    thresholds: Thresholds,
+    blocked_ips: set[str] | None = None,
+) -> tuple[int, Severity, float, AttackType, DetectionMethod, str, bool, dict[str, bool], dict[str, float]]:
+    score, rules, explanation = _score_rules(events, current, thresholds, blocked_ips=blocked_ips)
     attack_class = attack_class_from_score(score, rules)
     severity = severity_from_score(score)
     features = make_features(events, current)
@@ -203,18 +213,22 @@ def analyze_event(events: list[LoginEvent], current: LoginEvent, thresholds: Thr
     return score, severity, confidence, attack_class, DetectionMethod(method), explanation, blocked, rules, features
 
 
-def train_models(events: list[LoginEvent]) -> tuple[ModelMetric, ModelMetric]:
+def train_models(events: list[LoginEvent]) -> list[ModelMetric]:
     feature_rows: list[list[float]] = []
     labels: list[int] = []
+
+    detected_count = sum(1 for event in events if event.risk_score >= 70)
+    fp_count = sum(1 for event in events if event.risk_score < 25 and event.attack_class != AttackType.normal)
+
     rule_based = ModelMetric(
         id="rule-based",
         name="Rule-Based Engine",
         type="Rule-Based",
         status="active",
         version="v2.1.0",
-        accuracy=94.2,
-        detections=sum(1 for event in events if event.risk_score >= 70),
-        false_positives=sum(1 for event in events if event.risk_score < 25 and event.attack_class != AttackType.normal),
+        accuracy=None,  # Heuristic engine, no ground-truth evaluation set
+        detections=detected_count,
+        false_positives=fp_count,
         training_samples=len(events),
         last_trained_at=utc_now(),
         notes="Primary heuristic engine",
@@ -252,8 +266,8 @@ def train_models(events: list[LoginEvent]) -> tuple[ModelMetric, ModelMetric]:
             detections=sum(1 for event in events if event.attack_class != AttackType.normal),
             false_positives=sum(1 for event in events if event.attack_class == AttackType.normal and event.risk_score >= 50),
             last_trained_at=utc_now(),
-            notes="Anomaly detection trained on synthetic event windows",
-            accuracy=round(100.0 * (1.0 - (sum(labels) / max(1, len(labels)))) , 2),
+            accuracy=None,  # Unsupervised model, no labeled ground-truth dataset
+            notes="Unsupervised anomaly detector trained on live event features",
         )
     else:
         MODEL_BUNDLE.isolation_forest = None
@@ -267,7 +281,8 @@ def train_models(events: list[LoginEvent]) -> tuple[ModelMetric, ModelMetric]:
             anomaly_statistics={"trained": False, "reason": "insufficient data", "samples": len(feature_rows)},
             detections=0,
             false_positives=0,
-            notes="Insufficient event history for training",
+            accuracy=None,
+            notes="Requires at least 20 events for training",
         )
 
     if len(set(labels)) >= 2 and len(events) >= 30:
@@ -284,8 +299,8 @@ def train_models(events: list[LoginEvent]) -> tuple[ModelMetric, ModelMetric]:
             detections=sum(labels),
             false_positives=max(0, len(labels) - sum(labels)),
             last_trained_at=utc_now(),
-            accuracy=round(MODEL_BUNDLE.random_forest.score(feature_rows, labels) * 100.0, 2),
-            notes="Classifier trained on heuristic labels",
+            accuracy=None,  # Heuristic training labels, no external benchmark dataset
+            notes="Supervised classifier trained on heuristic event labels",
         )
     else:
         MODEL_BUNDLE.random_forest = None
@@ -303,10 +318,12 @@ def train_models(events: list[LoginEvent]) -> tuple[ModelMetric, ModelMetric]:
             },
             detections=0,
             false_positives=0,
-            notes="Insufficient labeled training data",
+            accuracy=None,
+            notes="Requires both normal and attack events (min 30 events)",
         )
 
-    return isolation_metric, random_metric
+    return [rule_based, isolation_metric, random_metric]
+
 
 
 def summarize_activity(events: list[LoginEvent], alerts: list[AlertRecord], windows: dict[str, int] | None = None) -> dict[str, Any]:

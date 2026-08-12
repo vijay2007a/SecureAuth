@@ -398,7 +398,7 @@ const navGroups: NavGroup[] = [
     label: "Detection & Monitoring",
     items: [
       { id: "live-monitoring",   label: "Live Monitor",      icon: Activity  },
-      { id: "alerts",            label: "Alerts",            icon: Bell, badge: 3 },
+      { id: "alerts",            label: "Alerts",            icon: Bell      },
       { id: "analytics",         label: "Analytics",         icon: BarChart2 },
       { id: "detection-models",  label: "Detection Models",  icon: Brain     },
       { id: "reports",           label: "Reports",           icon: FileText  },
@@ -414,7 +414,7 @@ const navGroups: NavGroup[] = [
   },
 ];
 
-const Sidebar = ({ current, onChange }: { current: Screen; onChange: (s: Screen) => void }) => (
+const Sidebar = ({ current, onChange, unreadAlertsCount }: { current: Screen; onChange: (s: Screen) => void; unreadAlertsCount: number }) => (
   <aside className="w-[218px] h-screen flex flex-col shrink-0 overflow-y-auto" style={{ background: "#0d1526" }}>
     {/* Logo */}
     <div className="px-4 py-5 border-b" style={{ borderColor: "rgba(255,255,255,0.06)" }}>
@@ -439,6 +439,7 @@ const Sidebar = ({ current, onChange }: { current: Screen; onChange: (s: Screen)
           <ul className="space-y-0.5">
             {group.items.map(item => {
               const isActive = current === item.id;
+              const badge = item.id === "alerts" && unreadAlertsCount > 0 ? unreadAlertsCount : item.badge;
               return (
                 <li key={item.id}>
                   <button
@@ -450,9 +451,9 @@ const Sidebar = ({ current, onChange }: { current: Screen; onChange: (s: Screen)
                   >
                     <item.icon size={14} className="shrink-0" />
                     <span className="flex-1 text-left">{item.label}</span>
-                    {item.badge && (
+                    {Boolean(badge) && (
                       <span className="bg-red-500 text-white text-[10px] font-bold px-1.5 py-0.5 rounded-full min-w-[18px] text-center leading-none">
-                        {item.badge}
+                        {badge}
                       </span>
                     )}
                   </button>
@@ -484,9 +485,27 @@ const Sidebar = ({ current, onChange }: { current: Screen; onChange: (s: Screen)
 // TopBar
 // ─────────────────────────────────────────────────────────────────────────────
 
-const TopBar = ({ onNav, currentUser, onLogout }: { onNav: (s: Screen) => void; currentUser: User | null; onLogout: () => void }) => {
+const TopBar = ({
+  onNav,
+  currentUser,
+  onLogout,
+  wsStatus,
+  unreadAlertsCount,
+}: {
+  onNav: (s: Screen) => void;
+  currentUser: User | null;
+  onLogout: () => void;
+  wsStatus: string;
+  unreadAlertsCount: number;
+}) => {
   const [notifOpen, setNotifOpen] = useState(false);
   const [profileOpen, setProfileOpen] = useState(false);
+
+  const statusConfig = {
+    connected: { color: "bg-emerald-500", text: "text-emerald-700", bg: "bg-emerald-50", border: "border-emerald-200", label: "Connected" },
+    connecting: { color: "bg-amber-500", text: "text-amber-700", bg: "bg-amber-50", border: "border-amber-200", label: "Reconnecting..." },
+    disconnected: { color: "bg-red-500", text: "text-red-700", bg: "bg-red-50", border: "border-red-200", label: "Disconnected" },
+  }[wsStatus] || { color: "bg-slate-400", text: "text-slate-700", bg: "bg-slate-50", border: "border-slate-200", label: "Offline" };
 
   return (
     <header className="h-[54px] bg-white border-b border-slate-200 flex items-center px-5 gap-3 shrink-0 z-20">
@@ -504,9 +523,9 @@ const TopBar = ({ onNav, currentUser, onLogout }: { onNav: (s: Screen) => void; 
       <div className="flex-1" />
 
       {/* System Status */}
-      <div className="flex items-center gap-1.5 bg-emerald-50 border border-emerald-200 px-3 py-1.5 rounded-full">
-        <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
-        <span className="text-[11px] font-semibold text-emerald-700">System Online</span>
+      <div className={`flex items-center gap-1.5 ${statusConfig.bg} border ${statusConfig.border} px-3 py-1.5 rounded-full`}>
+        <span className={`w-1.5 h-1.5 rounded-full ${statusConfig.color} ${wsStatus === "connected" ? "animate-pulse" : ""}`} />
+        <span className={`text-[11px] font-semibold ${statusConfig.text}`}>{statusConfig.label}</span>
       </div>
 
       {/* Notifications */}
@@ -516,30 +535,22 @@ const TopBar = ({ onNav, currentUser, onLogout }: { onNav: (s: Screen) => void; 
           className="relative w-9 h-9 flex items-center justify-center rounded-lg hover:bg-slate-100 transition text-slate-500"
         >
           <Bell size={17} />
-          <span className="absolute top-1.5 right-1.5 w-4 h-4 bg-red-500 rounded-full text-[9px] text-white flex items-center justify-center font-bold border-2 border-white">3</span>
+          {unreadAlertsCount > 0 && (
+            <span className="absolute top-1.5 right-1.5 w-4 h-4 bg-red-500 rounded-full text-[9px] text-white flex items-center justify-center font-bold border-2 border-white">
+              {unreadAlertsCount}
+            </span>
+          )}
         </button>
         {notifOpen && (
           <div className="absolute right-0 top-11 w-72 bg-white rounded-xl shadow-xl border border-slate-200 z-50 overflow-hidden">
             <div className="px-4 py-3 border-b border-slate-100 flex items-center justify-between">
               <p className="font-semibold text-slate-800 text-sm">Notifications</p>
-              <span className="text-[11px] text-slate-400">3 unread</span>
+              <span className="text-[11px] text-slate-400">{unreadAlertsCount} unread</span>
             </div>
-            {seedAlerts.slice(0, 3).map(a => (
-              <div
-                key={a.id}
-                className="px-4 py-3 hover:bg-slate-50 cursor-pointer border-b border-slate-50"
-                onClick={() => { onNav("alerts"); setNotifOpen(false); }}
-              >
-                <div className="flex items-start gap-2">
-                  <AlertCircle size={13} className={a.severity === "high" ? "text-red-500 mt-0.5 shrink-0" : "text-amber-500 mt-0.5 shrink-0"} />
-                  <div>
-                    <p className="text-[13px] font-medium text-slate-700 leading-snug">{a.title}</p>
-                    <p className="text-[11px] text-slate-400 mt-0.5">{a.time}</p>
-                  </div>
-                </div>
-              </div>
-            ))}
-            <div className="px-4 py-2.5">
+            <div className="px-4 py-3 text-xs text-slate-500">
+              {unreadAlertsCount > 0 ? `${unreadAlertsCount} unacknowledged alert(s) requiring attention.` : "No unread alerts."}
+            </div>
+            <div className="px-4 py-2.5 border-t border-slate-100">
               <button onClick={() => { onNav("alerts"); setNotifOpen(false); }} className="text-xs text-blue-600 font-medium hover:underline">
                 View all alerts →
               </button>
@@ -2074,96 +2085,110 @@ const AnalyticsScreen = () => {
 
 const DetectionModelsScreen = () => {
   const [models, setModels] = useState<any[]>([]);
+  const [retraining, setRetraining] = useState(false);
+  const [toast, setToast] = useState<{ msg: string; type: "success" | "error" | "info" } | null>(null);
+
+  const load = async () => {
+    try {
+      setModels(await apiFetch("/api/models"));
+    } catch (error) {
+      console.error(error);
+    }
+  };
 
   useEffect(() => {
-    const load = async () => {
-      try {
-        setModels(await apiFetch("/api/models"));
-      } catch (error) {
-        console.error(error);
-      }
-    };
     load();
   }, []);
+
+  const retrain = async () => {
+    setRetraining(true);
+    try {
+      const res = await apiFetch("/api/models/retrain", { method: "POST" });
+      setModels(res.models || []);
+      setToast({ msg: "Detection models re-evaluated against telemetry data", type: "success" });
+      window.setTimeout(() => setToast(null), 3000);
+    } catch (err) {
+      setToast({ msg: err instanceof Error ? err.message : "Retraining failed", type: "error" });
+    } finally {
+      setRetraining(false);
+    }
+  };
 
   return (
     <div className="space-y-5">
       <SectionHeader
         title="Detection Models"
         subtitle="Manage and monitor machine learning and rule-based detection engines"
-        actions={<Btn size="sm"><Plus size={12} />Add Model</Btn>}
+        actions={
+          <Btn size="sm" onClick={retrain} disabled={retraining}>
+            <RefreshCw size={12} className={retraining ? "animate-spin" : ""} />
+            {retraining ? "Re-evaluating..." : "Re-evaluate Models"}
+          </Btn>
+        }
       />
       <div className="grid grid-cols-2 gap-4">
         {models.map(model => (
-          <div key={model.id} className="bg-white rounded-xl border border-slate-200 shadow-sm p-5">
-            <div className="flex items-start justify-between mb-4">
-              <div className="flex items-center gap-3">
-                <div className={`w-10 h-10 rounded-lg flex items-center justify-center shrink-0 ${model.status === "training" ? "bg-blue-50" : "bg-emerald-50"}`}>
-                  <Brain size={17} className={model.status === "training" ? "text-blue-600" : "text-emerald-600"} />
+          <div key={model.id} className="bg-white rounded-xl border border-slate-200 shadow-sm p-5 flex flex-col justify-between">
+            <div>
+              <div className="flex items-start justify-between mb-4">
+                <div className="flex items-center gap-3">
+                  <div className={`w-10 h-10 rounded-lg flex items-center justify-center shrink-0 ${model.status === "active" ? "bg-emerald-50" : "bg-slate-100"}`}>
+                    <Brain size={17} className={model.status === "active" ? "text-emerald-600" : "text-slate-400"} />
+                  </div>
+                  <div>
+                    <p className="font-semibold text-slate-800 text-sm">{model.name}</p>
+                    <p className="text-[11px] text-slate-400">{model.type} • {model.version}</p>
+                  </div>
                 </div>
-                <div>
-                  <p className="font-semibold text-slate-800 text-sm">{model.name}</p>
-                  <p className="text-[11px] text-slate-400">{model.type} • {model.version}</p>
+                <div className="flex items-center gap-1.5 shrink-0">
+                  <StatusDot status={model.status} />
+                  <span className={`text-[11px] font-semibold capitalize ${model.status === "active" ? "text-emerald-600" : "text-slate-500"}`}>
+                    {model.status}
+                  </span>
                 </div>
               </div>
-              <div className="flex items-center gap-1.5 shrink-0">
-                <StatusDot status={model.status} />
-                <span className={`text-[11px] font-semibold capitalize ${model.status === "active" ? "text-emerald-600" : model.status === "training" ? "text-blue-600" : "text-slate-500"}`}>
-                  {model.status}
-                </span>
+
+              <div className="mb-4">
+                <div className="flex justify-between text-[12px] mb-1.5">
+                  <span className="text-slate-500">Benchmark Accuracy</span>
+                  <span className="font-bold text-slate-700">
+                    {model.accuracy !== null && model.accuracy !== undefined ? `${model.accuracy}%` : "Accuracy: N/A — no labeled evaluation dataset"}
+                  </span>
+                </div>
+                {model.accuracy !== null && model.accuracy !== undefined ? (
+                  <div className="h-2 bg-slate-100 rounded-full overflow-hidden">
+                    <div className="h-full rounded-full bg-emerald-500" style={{ width: `${model.accuracy}%` }} />
+                  </div>
+                ) : (
+                  <p className="text-[10px] text-slate-400 leading-tight">
+                    {model.notes || "Model relies on heuristic signatures or unsupervised scoring; accuracy requires a benchmark dataset."}
+                  </p>
+                )}
               </div>
             </div>
 
-            <div className="mb-4">
-              <div className="flex justify-between text-[12px] mb-1.5">
-                <span className="text-slate-500">Accuracy</span>
-                <span className="font-bold text-slate-700">{model.accuracy ?? 0}%</span>
+            <div>
+              <div className="grid grid-cols-3 gap-2 mb-4">
+                {[
+                  { label: "Detections", value: Number(model.detections ?? 0).toLocaleString() },
+                  { label: "False Positives", value: String(model.false_positives ?? 0) },
+                  { label: "Samples", value: String(model.training_samples ?? 0) },
+                ].map(s => (
+                  <div key={s.label} className="bg-slate-50 rounded-lg p-2.5">
+                    <p className="text-[9px] text-slate-400 uppercase tracking-wide font-medium">{s.label}</p>
+                    <p className="font-bold text-slate-700 text-sm mt-0.5">{s.value}</p>
+                  </div>
+                ))}
               </div>
-              <div className="h-2 bg-slate-100 rounded-full overflow-hidden">
-                <div
-                  className={`h-full rounded-full ${model.status === "training" ? "bg-blue-400" : "bg-emerald-500"}`}
-                  style={{ width: `${model.accuracy ?? 0}%` }}
-                />
+
+              <div className="flex items-center justify-between text-[11px] text-slate-400 pt-2 border-t border-slate-100">
+                <span>Last Updated: {model.last_trained_at ? new Date(model.last_trained_at).toLocaleString() : "Initial state"}</span>
               </div>
-            </div>
-
-            <div className="grid grid-cols-3 gap-2 mb-4">
-              {[
-                { label: "Detections", value: Number(model.detections ?? 0).toLocaleString() },
-                { label: "False Positives", value: String(model.false_positives ?? 0) },
-                { label: "Updated", value: model.updated ? new Date(model.updated).toLocaleDateString() : "—" },
-              ].map(s => (
-                <div key={s.label} className="bg-slate-50 rounded-lg p-2.5">
-                  <p className="text-[9px] text-slate-400 uppercase tracking-wide font-medium">{s.label}</p>
-                  <p className="font-bold text-slate-700 text-sm mt-0.5">{s.value}</p>
-                </div>
-              ))}
-            </div>
-
-            <div className="flex gap-2">
-              <Btn variant="outline" size="sm" className="flex-1">Configure</Btn>
-              <Btn variant="ghost" size="sm"><Eye size={12} />Details</Btn>
             </div>
           </div>
         ))}
       </div>
-      <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-5">
-        <p className="font-semibold text-slate-800 text-sm mb-4">Overall System Accuracy</p>
-        <div className="flex items-center gap-6">
-          <CircularProgress value={Math.round(models.find(m => typeof m.accuracy === "number")?.accuracy ?? 0)} size={120} />
-          <div className="flex-1 space-y-3">
-            {models.map(m => (
-              <div key={m.id} className="flex items-center gap-3">
-                <span className="text-[12px] text-slate-600 w-48 shrink-0">{m.name}</span>
-                <div className="flex-1 h-2 bg-slate-100 rounded-full overflow-hidden">
-                  <div className={`h-full rounded-full ${m.status === "training" ? "bg-blue-400" : "bg-emerald-500"}`} style={{ width: `${m.accuracy ?? 0}%` }} />
-                </div>
-                <span className="text-[12px] font-bold text-slate-700 w-12 text-right">{m.accuracy ?? 0}%</span>
-              </div>
-            ))}
-          </div>
-        </div>
-      </div>
+      {toast && <Toast message={toast.msg} type={toast.type} onClose={() => setToast(null)} />}
     </div>
   );
 };
@@ -2276,6 +2301,7 @@ const TestAccountsScreen = () => {
   const [showAdd, setShowAdd] = useState(false);
   const [newUser, setNewUser] = useState({ username: "", role: "Standard User" });
   const [loading, setLoading] = useState(false);
+  const [toast, setToast] = useState<{ msg: string; type: "success" | "error" | "info" } | null>(null);
 
   const load = async () => {
     try {
@@ -2299,26 +2325,52 @@ const TestAccountsScreen = () => {
       });
       setNewUser({ username: "", role: "Standard User" });
       setShowAdd(false);
+      setToast({ msg: "Test account created successfully", type: "success" });
       await load();
+    } catch (err) {
+      setToast({ msg: err instanceof Error ? err.message : "Failed to create account", type: "error" });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const generateAccounts = async () => {
+    setLoading(true);
+    try {
+      const res = await apiFetch("/api/test-accounts/generate?count=10", { method: "POST" });
+      await load();
+      setToast({ msg: `Generated ${res.count || 10} new test accounts`, type: "success" });
+    } catch (err) {
+      setToast({ msg: err instanceof Error ? err.message : "Failed to generate test accounts", type: "error" });
     } finally {
       setLoading(false);
     }
   };
 
   const toggleLock = async (account: any) => {
-    await apiFetch(`/api/test-accounts/${account.id}`, {
-      method: "PUT",
-      body: JSON.stringify({
-        locked: !account.locked,
-        status: !account.locked ? "locked" : "active",
-      }),
-    });
-    await load();
+    try {
+      await apiFetch(`/api/test-accounts/${account.id}`, {
+        method: "PUT",
+        body: JSON.stringify({
+          locked: !account.locked,
+          status: !account.locked ? "locked" : "active",
+        }),
+      });
+      setToast({ msg: `Account ${account.username} ${account.locked ? "unlocked" : "locked"}`, type: "info" });
+      await load();
+    } catch (err) {
+      setToast({ msg: err instanceof Error ? err.message : "Update failed", type: "error" });
+    }
   };
 
   const removeAccount = async (id: string) => {
-    await apiFetch(`/api/test-accounts/${id}`, { method: "DELETE" });
-    await load();
+    try {
+      await apiFetch(`/api/test-accounts/${id}`, { method: "DELETE" });
+      setToast({ msg: "Account removed", type: "info" });
+      await load();
+    } catch (err) {
+      setToast({ msg: err instanceof Error ? err.message : "Delete failed", type: "error" });
+    }
   };
 
   return (
@@ -2326,7 +2378,14 @@ const TestAccountsScreen = () => {
       <SectionHeader
         title="Test Accounts"
         subtitle="Manage isolated lab accounts used in attack simulations and detection testing"
-        actions={<Btn size="sm" onClick={() => setShowAdd(true)}><Plus size={12} />Add Account</Btn>}
+        actions={
+          <div className="flex gap-2">
+            <Btn variant="outline" size="sm" onClick={generateAccounts} disabled={loading}>
+              <RefreshCw size={12} className={loading ? "animate-spin" : ""} />Generate Accounts (10)
+            </Btn>
+            <Btn size="sm" onClick={() => setShowAdd(true)}><Plus size={12} />Add Account</Btn>
+          </div>
+        }
       />
 
       {showAdd && (
@@ -2395,6 +2454,7 @@ const TestAccountsScreen = () => {
           <Btn variant="outline" size="sm"><Download size={11} />Export</Btn>
         </div>
       </div>
+      {toast && <Toast message={toast.msg} type={toast.type} onClose={() => setToast(null)} />}
     </div>
   );
 };
@@ -2708,9 +2768,39 @@ export default function App() {
   const [loginEmail, setLoginEmail] = useState("");
   const [loginPassword, setLoginPassword] = useState("");
   const [loginBusy, setLoginBusy] = useState(false);
+  const [wsStatus, setWsStatus] = useState<string>("connecting");
+  const [unreadAlertsCount, setUnreadAlertsCount] = useState<number>(0);
   const wsRef = useRef<WebSocket | null>(null);
   const pushTokenRef = useRef<string | null>(null);
   const pushCleanupRef = useRef<(() => void) | null>(null);
+
+  const refreshAlertsCount = async () => {
+    try {
+      const data = await apiFetch("/api/alerts");
+      const openCount = (data ?? []).filter((a: any) => a.status === "open" || a.status === "pending").length;
+      setUnreadAlertsCount(openCount);
+    } catch {
+      // ignore
+    }
+  };
+
+  useEffect(() => {
+    refreshAlertsCount();
+    const unSubWsStatus = wsEvents.on("ws_status", (data) => {
+      if (data.status) setWsStatus(data.status);
+    });
+    const unSubAlert = wsEvents.on("alert_created", () => {
+      refreshAlertsCount();
+    });
+    const unSubReset = wsEvents.on("simulations.reset", () => {
+      setUnreadAlertsCount(0);
+    });
+    return () => {
+      unSubWsStatus();
+      unSubAlert();
+      unSubReset();
+    };
+  }, []);
 
   useEffect(() => {
     if (!auth || !isFirebaseConfigured) {
@@ -2822,9 +2912,11 @@ export default function App() {
         token = getAccessToken();
       }
       if (!token) return;
+      setWsStatus("connecting");
       const socket = new WebSocket(wsUrl(`/ws/live?token=${encodeURIComponent(token)}`));
       wsRef.current = socket;
       socket.onopen = () => {
+        setWsStatus("connected");
         wsEvents.emit("ws_status", { status: "connected" });
       };
       socket.onmessage = (evt) => {
@@ -2838,10 +2930,12 @@ export default function App() {
         }
       };
       socket.onerror = () => {
+        setWsStatus("disconnected");
         wsEvents.emit("ws_status", { status: "disconnected" });
         socket.close();
       };
       socket.onclose = () => {
+        setWsStatus("disconnected");
         wsEvents.emit("ws_status", { status: "disconnected" });
         if (!closed) reconnectTimer = window.setTimeout(connect, 2500);
       };
@@ -2924,9 +3018,9 @@ export default function App() {
 
   return (
     <div className="flex h-screen overflow-hidden" style={{ background: "#f1f5f9", fontFamily: "'Inter', sans-serif" }}>
-      <Sidebar current={screen} onChange={setScreen} />
+      <Sidebar current={screen} onChange={setScreen} unreadAlertsCount={unreadAlertsCount} />
       <div className="flex-1 flex flex-col overflow-hidden min-w-0">
-        <TopBar onNav={setScreen} currentUser={currentUser} onLogout={handleLogout} />
+        <TopBar onNav={setScreen} currentUser={currentUser} onLogout={handleLogout} wsStatus={wsStatus} unreadAlertsCount={unreadAlertsCount} />
         <main className="flex-1 overflow-y-auto p-6 min-w-0">
           {renderScreen()}
         </main>
@@ -2934,3 +3028,4 @@ export default function App() {
     </div>
   );
 }
+

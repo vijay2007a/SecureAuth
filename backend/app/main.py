@@ -14,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.encoders import jsonable_encoder
 
-from .detection import analyze_event, password_ref, summarize_activity, train_models
+from .detection import analyze_event, make_features, password_ref, summarize_activity, train_models
 from .notifications import (
     delete_notification_token,
     register_notification_token,
@@ -28,9 +28,11 @@ from .models import (
     AlertRecord,
     AlertStatus,
     AlertUpdateRequest,
+    AttackType,
     AuthenticatedUser,
     CredentialDataset,
     DatasetUploadResponse,
+    DetectionMethod,
     IPControl,
     IPControlCreateRequest,
     IPControlType,
@@ -210,11 +212,18 @@ async def _build_simulation_events(
     
     try:
         total_attempts = simulation.attempts
+        blocked_ips = {ip.ip for ip in store.list_ips() if ip.type.value == "blocked"}
+
         for idx in range(total_attempts):
             account = accounts[idx % len(accounts)]
             source_ip = source_ips[idx % len(source_ips)] if source_ips else simulation.source_ip
             password = passwords[idx % len(passwords)] if passwords else "LabPassword!"
-            is_success = kind == "normal" and idx % 4 == 0
+
+            if account.locked:
+                is_success = False
+            else:
+                is_success = kind == "normal" and idx % 4 == 0
+
             event = LoginEvent(
                 id=str(uuid4()),
                 timestamp=utc_now() + timedelta(seconds=float(idx) * simulation.parameters.get("delay_seconds", 0.0)),
@@ -228,9 +237,24 @@ async def _build_simulation_events(
                 user_agent="SecureAuth-Lab/1.0",
                 labels={"password_hash": password_ref(password)},
             )
-            score, severity, confidence, attack_class, method, explanation, blocked, rules, features = analyze_event(
-                existing_events + events, event, thresholds
-            )
+
+            if account.locked:
+                score, severity, confidence, attack_class, method, explanation, blocked, rules, features = (
+                    100,
+                    Severity.critical,
+                    1.0,
+                    AttackType.high_risk,
+                    DetectionMethod.rule_based,
+                    "Target test account is locked due to security violations",
+                    True,
+                    {"account_locked": True},
+                    make_features(existing_events + events, event),
+                )
+            else:
+                score, severity, confidence, attack_class, method, explanation, blocked, rules, features = analyze_event(
+                    existing_events + events, event, thresholds, blocked_ips=blocked_ips
+                )
+
             event.risk_score = score
             event.severity = severity
             event.confidence = confidence
@@ -240,15 +264,18 @@ async def _build_simulation_events(
             event.blocked = blocked
             if blocked:
                 event.success = False
+
             store.add_event(event)
             events.append(event)
             existing_events.append(event)
+
             account.attempts += 1
             account.last_login = event.timestamp
             if not event.success and account.attempts >= 5:
                 account.locked = True
                 account.status = AccountStatus.locked
             store.upsert_account(account)
+
             if score >= thresholds.risk_alert_threshold:
                 alert = AlertRecord(
                     id=str(uuid4()),
@@ -265,6 +292,7 @@ async def _build_simulation_events(
                 )
                 store.add_alert(alert)
                 alerts.append(alert)
+
             if broadcast:
                 await broadcast(
                     {
@@ -323,15 +351,11 @@ async def _build_simulation_events(
 
 def _refresh_models(store: BaseStore) -> list[ModelMetric]:
     events = store.list_events()
-    isolation_metric, random_metric = train_models(events)
-    models = [isolation_metric, random_metric]
+    models = train_models(events)
     for model in models:
         store.upsert_model(model)
-    existing = {model.id for model in models}
-    for model in store.list_models():
-        if model.id not in existing:
-            models.append(model)
-    return models
+    return store.list_models()
+
 
 
 def create_app(store: BaseStore | None = None) -> FastAPI:
