@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from collections import Counter
 from datetime import datetime, timedelta, timezone
@@ -8,12 +9,18 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.encoders import jsonable_encoder
 
 from .detection import analyze_event, password_ref, summarize_activity, train_models
+from .notifications import (
+    delete_notification_token,
+    register_notification_token,
+    send_password_spray_notification,
+    send_test_security_alert,
+)
 from .models import (
     AccountCreateRequest,
     AccountStatus,
@@ -22,12 +29,16 @@ from .models import (
     AlertStatus,
     AlertUpdateRequest,
     AuthenticatedUser,
+    CredentialDataset,
+    DatasetUploadResponse,
     IPControl,
     IPControlCreateRequest,
     IPControlType,
     IPControlUpdateRequest,
     LoginEvent,
     ModelMetric,
+    NotificationTokenDeleteRequest,
+    NotificationTokenRequest,
     ReportRecord,
     Role,
     SettingsPayload,
@@ -43,6 +54,9 @@ from .models import (
 from .firebase_init import init_firebase_app
 from .security import get_current_user, require_roles, verify_firebase_token
 from .store import BaseStore, FirestoreStore, MemoryStore
+
+
+logger = logging.getLogger(__name__)
 
 
 class ConnectionManager:
@@ -165,7 +179,16 @@ async def _build_simulation_events(
     events: list[LoginEvent] = []
     thresholds = store.get_thresholds()
     existing_events = store.list_events()[::-1]
+    
     if broadcast:
+        await broadcast(
+            {
+                "type": "simulation.initialized",
+                "simulation_id": simulation.id,
+                "progress": 0,
+                "simulation": simulation.model_dump(mode="json"),
+            }
+        )
         await broadcast(
             {
                 "type": "simulation.started",
@@ -174,103 +197,128 @@ async def _build_simulation_events(
                 "attack_type": kind,
             }
         )
-    for idx in range(simulation.attempts):
-        account = accounts[idx % len(accounts)]
-        source_ip = source_ips[idx % len(source_ips)] if source_ips else simulation.source_ip
-        password = passwords[idx % len(passwords)] if passwords else "LabPassword!"
-        is_success = kind == "normal" and idx % 4 == 0
-        event = LoginEvent(
-            id=str(uuid4()),
-            timestamp=utc_now() + timedelta(seconds=float(idx) * simulation.parameters.get("delay_seconds", 0.0)),
-            username=account.username,
-            test_account_id=account.id,
-            source_ip=source_ip,
-            password_ref=password_ref(password),
-            success=is_success,
-            simulation_id=simulation.id,
-            attack_type=kind,
-            user_agent="SecureAuth-Lab/1.0",
-            labels={"password_hash": password_ref(password)},
+        await broadcast(
+            {
+                "type": "simulation.progress",
+                "simulation_id": simulation.id,
+                "attempts_completed": 0,
+                "attempts_total": simulation.attempts,
+                "progress": 10,
+                "stage": "preparation",
+            }
         )
-        score, severity, confidence, attack_class, method, explanation, blocked, rules, features = analyze_event(
-            existing_events + events, event, thresholds
-        )
-        event.risk_score = score
-        event.severity = severity
-        event.confidence = confidence
-        event.attack_class = attack_class
-        event.detection_method = method
-        event.explanation = explanation
-        event.blocked = blocked
-        if blocked:
-            event.success = False
-        store.add_event(event)
-        events.append(event)
-        existing_events.append(event)
-        account.attempts += 1
-        account.last_login = event.timestamp
-        if not event.success and account.attempts >= 5:
-            account.locked = True
-            account.status = AccountStatus.locked
-        store.upsert_account(account)
-        if score >= thresholds.risk_alert_threshold:
-            alert = AlertRecord(
+    
+    try:
+        total_attempts = simulation.attempts
+        for idx in range(total_attempts):
+            account = accounts[idx % len(accounts)]
+            source_ip = source_ips[idx % len(source_ips)] if source_ips else simulation.source_ip
+            password = passwords[idx % len(passwords)] if passwords else "LabPassword!"
+            is_success = kind == "normal" and idx % 4 == 0
+            event = LoginEvent(
                 id=str(uuid4()),
-                severity=severity,
-                attack_type=event.attack_class.value,
-                source_ip=event.source_ip,
-                affected_accounts=[account.username],
-                risk_score=score,
-                confidence=confidence,
-                explanation=explanation,
-                timestamp=event.timestamp,
-                status=AlertStatus.open,
-                event_id=event.id,
+                timestamp=utc_now() + timedelta(seconds=float(idx) * simulation.parameters.get("delay_seconds", 0.0)),
+                username=account.username,
+                test_account_id=account.id,
+                source_ip=source_ip,
+                password_ref=password_ref(password),
+                success=is_success,
+                simulation_id=simulation.id,
+                attack_type=kind,
+                user_agent="SecureAuth-Lab/1.0",
+                labels={"password_hash": password_ref(password)},
             )
-            store.add_alert(alert)
-            alerts.append(alert)
+            score, severity, confidence, attack_class, method, explanation, blocked, rules, features = analyze_event(
+                existing_events + events, event, thresholds
+            )
+            event.risk_score = score
+            event.severity = severity
+            event.confidence = confidence
+            event.attack_class = attack_class
+            event.detection_method = method
+            event.explanation = explanation
+            event.blocked = blocked
+            if blocked:
+                event.success = False
+            store.add_event(event)
+            events.append(event)
+            existing_events.append(event)
+            account.attempts += 1
+            account.last_login = event.timestamp
+            if not event.success and account.attempts >= 5:
+                account.locked = True
+                account.status = AccountStatus.locked
+            store.upsert_account(account)
+            if score >= thresholds.risk_alert_threshold:
+                alert = AlertRecord(
+                    id=str(uuid4()),
+                    severity=severity,
+                    attack_type=event.attack_class.value,
+                    source_ip=event.source_ip,
+                    affected_accounts=[account.username],
+                    risk_score=score,
+                    confidence=confidence,
+                    explanation=explanation,
+                    timestamp=event.timestamp,
+                    status=AlertStatus.open,
+                    event_id=event.id,
+                )
+                store.add_alert(alert)
+                alerts.append(alert)
+            if broadcast:
+                await broadcast(
+                    {
+                        "type": "login_event",
+                        "simulation_id": simulation.id,
+                        "event": event.model_dump(mode="json"),
+                    }
+                )
+                await broadcast(
+                    {
+                        "type": "detection_result",
+                        "simulation_id": simulation.id,
+                        "event_id": event.id,
+                        "risk_score": score,
+                        "severity": severity.value,
+                        "confidence": confidence,
+                        "attack_class": attack_class.value,
+                        "blocked": blocked,
+                        "explanation": explanation,
+                    }
+                )
+                if alerts and alerts[-1].event_id == event.id:
+                    await broadcast(
+                        {
+                            "type": "alert_created",
+                            "simulation_id": simulation.id,
+                            "alert": alerts[-1].model_dump(mode="json"),
+                        }
+                    )
+                progress_pct = min(95, 10 + round(((idx + 1) / total_attempts) * 85))
+                await broadcast(
+                    {
+                        "type": "simulation.progress",
+                        "simulation_id": simulation.id,
+                        "attempts_completed": idx + 1,
+                        "attempts_total": total_attempts,
+                        "progress": progress_pct,
+                    }
+                )
+        if events:
+            simulation.completed_at = events[-1].timestamp
+        simulation.status = SimulationStatus.completed
+        return events, alerts
+    except Exception as exc:
+        simulation.status = SimulationStatus.failed
         if broadcast:
             await broadcast(
                 {
-                    "type": "login_event",
+                    "type": "simulation.failed",
                     "simulation_id": simulation.id,
-                    "event": event.model_dump(mode="json"),
+                    "error": str(exc),
                 }
             )
-            await broadcast(
-                {
-                    "type": "detection_result",
-                    "simulation_id": simulation.id,
-                    "event_id": event.id,
-                    "risk_score": score,
-                    "severity": severity.value,
-                    "confidence": confidence,
-                    "attack_class": attack_class.value,
-                    "blocked": blocked,
-                    "explanation": explanation,
-                }
-            )
-            if alerts and alerts[-1].event_id == event.id:
-                await broadcast(
-                    {
-                        "type": "alert_created",
-                        "simulation_id": simulation.id,
-                        "alert": alerts[-1].model_dump(mode="json"),
-                    }
-                )
-            await broadcast(
-                {
-                    "type": "simulation.progress",
-                    "simulation_id": simulation.id,
-                    "attempts_completed": idx + 1,
-                    "attempts_total": simulation.attempts,
-                    "progress": round(((idx + 1) / simulation.attempts) * 100),
-                }
-            )
-    if events:
-        simulation.completed_at = events[-1].timestamp
-    simulation.status = SimulationStatus.completed
-    return events, alerts
+        raise exc
 
 
 def _refresh_models(store: BaseStore) -> list[ModelMetric]:
@@ -431,6 +479,54 @@ def create_app(store: BaseStore | None = None) -> FastAPI:
             store._ips.pop(ip_id, None)  # type: ignore[attr-defined]
         return {"deleted": True}
 
+    @app.post("/api/notifications/register-token")
+    def register_push_token(
+        payload: NotificationTokenRequest,
+        user: AuthenticatedUser = Depends(get_current_user),
+    ) -> dict[str, Any]:
+        token = register_notification_token(
+            store,
+            user,
+            payload.token.strip(),
+            device_name=payload.device_name,
+            platform=payload.platform,
+        )
+        return {"registered": True, "token_id": token.id, "uid": user.id}
+
+    @app.delete("/api/notifications/token")
+    def delete_push_token(
+        payload: NotificationTokenDeleteRequest,
+        user: AuthenticatedUser = Depends(get_current_user),
+    ) -> dict[str, Any]:
+        deleted = delete_notification_token(store, user, payload.token.strip())
+        return {"deleted": deleted}
+
+    @app.post("/api/notifications/test-alert")
+    @app.post("/api/notifications/test-security-alert")
+    async def send_test_alert(
+        user: AuthenticatedUser = Depends(require_roles(Role.admin)),
+    ) -> dict[str, Any]:
+        alert = AlertRecord(
+            id=str(uuid4()),
+            severity=Severity.info,
+            attack_type="test_security_alert",
+            source_ip="127.0.0.1",
+            affected_accounts=[user.email],
+            risk_score=0,
+            confidence=1.0,
+            explanation="Push notifications are working successfully.",
+            status=AlertStatus.open,
+        )
+        store.add_alert(alert)
+        await manager.broadcast(
+            {
+                "type": "alert_created",
+                "alert": alert.model_dump(mode="json"),
+                "source": "test_security_alert",
+            }
+        )
+        return send_test_security_alert(store, user)
+
     @app.get("/api/login-events")
     def list_events(
         attack_type: str | None = None,
@@ -465,6 +561,100 @@ def create_app(store: BaseStore | None = None) -> FastAPI:
         start_index = (page - 1) * page_size
         items = filtered[start_index : start_index + page_size]
         return {"items": [item.model_dump(mode="json") for item in items], "total": total, "page": page, "page_size": page_size}
+
+    @app.post("/api/simulations/upload-credentials")
+    async def upload_credentials(
+        file: UploadFile = File(...),
+        user: AuthenticatedUser = Depends(require_roles(Role.admin, Role.analyst)),
+    ) -> dict[str, Any]:
+        if not file.filename:
+            raise HTTPException(status_code=400, detail="No file selected")
+        ext = Path(file.filename).suffix.lower()
+        if ext not in {".csv", ".txt"}:
+            raise HTTPException(status_code=400, detail="Only .csv and .txt files are supported")
+
+        try:
+            content_bytes = await file.read()
+            text = content_bytes.decode("utf-8-sig", errors="replace")
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to read file: {e}")
+
+        import csv
+        import io
+
+        lines = [line for line in text.splitlines() if line.strip()]
+        total_rows = len(lines)
+        if total_rows == 0:
+            raise HTTPException(status_code=400, detail="Uploaded file is empty")
+
+        reader = csv.reader(io.StringIO(text))
+        rows = list(reader)
+
+        valid_credentials: list[dict[str, str]] = []
+        seen_pairs: set[tuple[str, str]] = set()
+        invalid_rows = 0
+        duplicate_rows = 0
+        header_skipped = False
+
+        for idx, row in enumerate(rows):
+            if not row or not any(cell.strip() for cell in row):
+                continue
+            cleaned = [cell.strip() for cell in row]
+            if len(cleaned) < 2:
+                invalid_rows += 1
+                continue
+
+            username, password = cleaned[0], cleaned[1]
+
+            if idx == 0 and not header_skipped:
+                if username.lower() in {"email", "username", "user", "login"} and password.lower() in {"password", "pass", "pwd"}:
+                    header_skipped = True
+                    total_rows = max(0, total_rows - 1)
+                    continue
+
+            if not username or not password:
+                invalid_rows += 1
+                continue
+
+            pair = (username, password)
+            if pair in seen_pairs:
+                duplicate_rows += 1
+                continue
+
+            seen_pairs.add(pair)
+            valid_credentials.append({"username": username, "password": password})
+
+        if not valid_credentials:
+            raise HTTPException(status_code=400, detail="No valid credentials found in CSV file")
+
+        dataset_id = str(uuid4())
+        dataset_meta = CredentialDataset(
+            id=dataset_id,
+            filename=file.filename,
+            total_rows=total_rows,
+            valid_credentials=len(valid_credentials),
+            invalid_rows=invalid_rows,
+            duplicate_rows=duplicate_rows,
+        )
+
+        store.store_credentials(dataset_id, valid_credentials, dataset_meta)
+
+        return {
+            "dataset_id": dataset_id,
+            "filename": file.filename,
+            "total_rows": total_rows,
+            "valid_credentials": len(valid_credentials),
+            "invalid_rows": invalid_rows,
+            "duplicate_rows": duplicate_rows,
+        }
+
+    @app.delete("/api/simulations/reset")
+    async def reset_simulations(
+        user: AuthenticatedUser = Depends(require_roles(Role.admin)),
+    ) -> dict[str, Any]:
+        result = store.clear_simulation_data()
+        await manager.broadcast({"type": "simulations.reset", "result": result})
+        return {"reset": True, **result}
 
     @app.post("/api/simulations/password-spray")
     async def password_spray(
@@ -501,6 +691,21 @@ def create_app(store: BaseStore | None = None) -> FastAPI:
             "events": [event.model_dump(mode="json") for event in events],
             "alerts": [alert.model_dump(mode="json") for alert in alerts],
         }
+        if alerts:
+            try:
+                target_email = payload.target_email or user.email
+                spray_result = send_password_spray_notification(
+                    store,
+                    user,
+                    target_email=target_email,
+                    attempts=payload.attempts,
+                    source_ip=payload.source_ip,
+                    severity=alerts[0].severity,
+                    simulation_id=simulation.id,
+                )
+                response["notification"] = spray_result
+            except Exception:
+                logger.exception("Failed to send password spray notification")
         await manager.broadcast({"type": "simulation.completed", **response})
         return response
 
@@ -509,133 +714,81 @@ def create_app(store: BaseStore | None = None) -> FastAPI:
         payload: SimulationRequest,
         user: AuthenticatedUser = Depends(require_roles(Role.admin, Role.analyst)),
     ) -> dict[str, Any]:
-        accounts = _select_accounts(store, payload.account_count or payload.attempts)
-        credentials = payload.credentials or [
-            {"username": account.username, "password": password}
-            for account, password in zip(accounts, _sample_passwords(None), strict=False)
-        ]
+        if payload.dataset_id:
+            stored_creds = store.get_credentials(payload.dataset_id)
+            if not stored_creds:
+                raise HTTPException(status_code=400, detail="Dataset not found or contains no valid credentials")
+            credentials = stored_creds
+        else:
+            credentials = payload.credentials
+
         if not credentials:
-            credentials = [{"username": account.username, "password": "LabPassword!"} for account in accounts]
+            accounts = _select_accounts(store, payload.account_count or payload.attempts)
+            credentials = [
+                {"username": account.username, "password": password}
+                for account, password in zip(accounts, _sample_passwords(None), strict=False)
+            ]
+
+        attempts = min(payload.attempts, len(credentials)) if payload.attempts else len(credentials)
+        selected_creds = credentials[:attempts]
+
+        existing_accounts = {a.username: a for a in store.list_accounts()}
+        sim_accounts: list[TestAccount] = []
+        for item in selected_creds:
+            uname = item["username"]
+            if uname in existing_accounts:
+                sim_accounts.append(existing_accounts[uname])
+            else:
+                acc = TestAccount(id=str(uuid4()), username=uname, display_name=uname.split("@")[0])
+                store.upsert_account(acc)
+                existing_accounts[uname] = acc
+                sim_accounts.append(acc)
+
+        passwords = [item["password"] for item in selected_creds]
         source_ips = payload.source_ips or [payload.source_ip]
+
         simulation = SimulationRecord(
             id=str(uuid4()),
             name=payload.name or "Credential Stuffing Simulation",
             attack_type="credential_stuffing",
             status=SimulationStatus.running,
             source_ip=payload.source_ip,
-            attempts=payload.attempts,
-            affected_accounts=[item["username"] for item in credentials[: payload.attempts]],
+            attempts=len(selected_creds),
+            affected_accounts=[item["username"] for item in selected_creds],
             parameters=payload.model_dump(exclude={"password", "passwords", "credentials"}),
         )
         store.add_simulation(simulation)
-        await manager.broadcast(
-            {
-                "type": "simulation.started",
-                "simulation": simulation.model_dump(mode="json"),
-                "attempts": simulation.attempts,
-                "attack_type": "credential_stuffing",
-            }
+
+        events, alerts = await _build_simulation_events(
+            store,
+            simulation,
+            sim_accounts,
+            source_ips,
+            passwords,
+            "credential_stuffing",
+            manager.broadcast,
         )
-        events: list[LoginEvent] = []
-        alerts: list[AlertRecord] = []
-        thresholds = store.get_thresholds()
-        existing = store.list_events()[::-1]
-        for idx, credential in enumerate(credentials[: payload.attempts]):
-            account = next((item for item in accounts if item.username == credential["username"]), accounts[idx % len(accounts)])
-            source_ip = source_ips[idx % len(source_ips)]
-            event = LoginEvent(
-                id=str(uuid4()),
-                timestamp=utc_now() + timedelta(seconds=payload.delay_seconds * idx),
-                username=credential["username"],
-                test_account_id=account.id,
-                source_ip=source_ip,
-                password_ref=password_ref(credential["password"]),
-                success=False,
-                simulation_id=simulation.id,
-                attack_type="credential_stuffing",
-                labels={"password_hash": password_ref(credential["password"])},
-            )
-            score, severity, confidence, attack_class, method, explanation, blocked, rules, features = analyze_event(
-                existing + events, event, thresholds
-            )
-            event.risk_score = score
-            event.severity = severity
-            event.confidence = confidence
-            event.attack_class = attack_class
-            event.detection_method = method
-            event.explanation = explanation
-            event.blocked = blocked
-            store.add_event(event)
-            events.append(event)
-            existing.append(event)
-            account.attempts += 1
-            account.last_login = event.timestamp
-            if account.attempts >= 5:
-                account.locked = True
-            store.upsert_account(account)
-            if score >= thresholds.risk_alert_threshold:
-                alert = AlertRecord(
-                    id=str(uuid4()),
-                    severity=severity,
-                    attack_type=event.attack_class.value,
-                    source_ip=event.source_ip,
-                    affected_accounts=[account.username],
-                    risk_score=score,
-                    confidence=confidence,
-                    explanation=explanation,
-                    timestamp=event.timestamp,
-                    status=AlertStatus.open,
-                    event_id=event.id,
-                )
-                store.add_alert(alert)
-                alerts.append(alert)
-            await manager.broadcast(
-                {
-                    "type": "login_event",
-                    "simulation_id": simulation.id,
-                    "event": event.model_dump(mode="json"),
-                }
-            )
-            await manager.broadcast(
-                {
-                    "type": "detection_result",
-                    "simulation_id": simulation.id,
-                    "event_id": event.id,
-                    "risk_score": score,
-                    "severity": severity.value,
-                    "confidence": confidence,
-                    "attack_class": attack_class.value,
-                    "blocked": blocked,
-                    "explanation": explanation,
-                }
-            )
-            if alerts and alerts[-1].event_id == event.id:
-                await manager.broadcast(
-                    {
-                        "type": "alert_created",
-                        "simulation_id": simulation.id,
-                        "alert": alerts[-1].model_dump(mode="json"),
-                    }
-                )
-            await manager.broadcast(
-                {
-                    "type": "simulation.progress",
-                    "simulation_id": simulation.id,
-                    "attempts_completed": idx + 1,
-                    "attempts_total": payload.attempts,
-                    "progress": round(((idx + 1) / payload.attempts) * 100),
-                }
-            )
         _refresh_models(store)
-        if events:
-            simulation.completed_at = events[-1].timestamp
-        simulation.status = SimulationStatus.completed
         store.add_simulation(simulation)
+
         response = {
             "simulation": simulation.model_dump(mode="json"),
             "events": [event.model_dump(mode="json") for event in events],
             "alerts": [alert.model_dump(mode="json") for alert in alerts],
         }
+        if alerts:
+            try:
+                send_password_spray_notification(
+                    store,
+                    user,
+                    target_email=payload.target_email or user.email or simulation.affected_accounts[0],
+                    attempts=simulation.attempts,
+                    source_ip=simulation.source_ip,
+                    severity=alerts[0].severity,
+                    simulation_id=simulation.id,
+                )
+            except Exception:
+                logger.exception("Failed to send credential stuffing notification")
         await manager.broadcast({"type": "simulation.completed", **response})
         return response
 

@@ -13,9 +13,12 @@ import {
   ResponsiveContainer, BarChart, Bar, PieChart, Pie, Cell,
 } from "recharts";
 import { onAuthStateChanged, signInWithEmailAndPassword, signOut, type User } from "firebase/auth";
-import { auth, isFirebaseConfigured } from "./firebase";
+import { getMessaging, getToken, isSupported as isMessagingSupported, onMessage } from "firebase/messaging";
+import { app as firebaseApp, auth, isFirebaseConfigured } from "./firebase";
 import { clearAccessToken, getAccessToken, setAccessToken } from "./session";
 import { LoginScreen } from "./LoginScreen";
+import { wsEvents } from "./events";
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -125,29 +128,48 @@ const reportRows = [
 const API_BASE_URL = import.meta.env.VITE_API_URL ?? import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8000";
 const WS_BASE_URL = import.meta.env.VITE_WS_URL ?? import.meta.env.VITE_WS_BASE_URL ?? "ws://127.0.0.1:8000";
 const DEV_AUTH_TOKEN = import.meta.env.VITE_DEV_AUTH_TOKEN ?? "dev-admin-token";
+const FIREBASE_VAPID_KEY = import.meta.env.VITE_FIREBASE_VAPID_KEY ?? "";
 
 const authHeaders = () => ({
   Authorization: `Bearer ${getAccessToken() || DEV_AUTH_TOKEN}`,
 });
 
 const apiFetch = async (path: string, init: RequestInit = {}) => {
+  const isFormData = init.body instanceof FormData;
+  const headers: Record<string, string> = {
+    ...authHeaders(),
+    ...((init.headers as Record<string, string>) ?? {}),
+  };
+  if (!isFormData && !headers["Content-Type"]) {
+    headers["Content-Type"] = "application/json";
+  }
+
   const response = await fetch(`${API_BASE_URL}${path}`, {
     ...init,
-    headers: {
-      "Content-Type": "application/json",
-      ...authHeaders(),
-      ...(init.headers ?? {}),
-    },
+    headers,
   });
+
   if (!response.ok) {
-    const text = await response.text();
-    throw new Error(text || `Request failed: ${response.status}`);
+    let errorMsg = `Request failed (${response.status})`;
+    try {
+      const text = await response.text();
+      const parsed = JSON.parse(text);
+      errorMsg = parsed.detail || parsed.message || text;
+    } catch {
+      // Use fallback errorMsg
+    }
+    throw new Error(errorMsg);
   }
   if (response.status === 204) return null;
   return response.json();
 };
 
+
 const wsUrl = (path: string) => `${WS_BASE_URL}${path}`;
+
+const buildMessagingWorkerUrl = () => {
+  return "/firebase-messaging-sw.js";
+};
 
 const formatAttackType = (value: string) => {
   if (value === "password_spray") return "Password Spray";
@@ -569,13 +591,14 @@ const TopBar = ({ onNav, currentUser, onLogout }: { onNav: (s: Screen) => void; 
 // Dashboard Screen
 // ─────────────────────────────────────────────────────────────────────────────
 
-const DashboardScreen = ({ onNav }: { onNav: (s: Screen) => void }) => {
+const DashboardScreen = ({ onNav, canSendTestAlert }: { onNav: (s: Screen) => void; canSendTestAlert: boolean }) => {
   const [sprayPass, setSprayPass] = useState("Spring2025!");
   const [sprayTargets, setSprayTargets] = useState("12");
   const [sprayDelay, setSprayDelay] = useState("0");
   const [maxAttempts, setMaxAttempts] = useState("12");
   const [sprayRunning, setSprayRunning] = useState(false);
   const [stuffRunning, setStuffRunning] = useState(false);
+  const [testAlertRunning, setTestAlertRunning] = useState(false);
   const [sprayPct, setSprayPct] = useState(0);
   const [stuffPct, setStuffPct] = useState(0);
   const [feedFilter, setFeedFilter] = useState("All");
@@ -664,6 +687,18 @@ const DashboardScreen = ({ onNav }: { onNav: (s: Screen) => void }) => {
     }
   };
 
+  const sendTestAlert = async () => {
+    setTestAlertRunning(true);
+    try {
+      const result = await apiFetch("/api/notifications/test-alert", { method: "POST" });
+      showToast(result?.skipped ? "Test alert skipped by cooldown" : "Test alert sent", "success");
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : "Test alert failed", "error");
+    } finally {
+      setTestAlertRunning(false);
+    }
+  };
+
   const feedRows = (dashboard?.liveFeed ?? seedFeed).map(formatEventRow);
   const alerts = dashboard?.recentAlerts ?? seedAlerts;
   const attackTrendData = dashboard?.attackTrends ?? attackTrendsData;
@@ -674,14 +709,25 @@ const DashboardScreen = ({ onNav }: { onNav: (s: Screen) => void }) => {
 
   return (
     <div className="space-y-5">
-      <div className="flex items-start justify-between">
+      <div className="flex items-start justify-between gap-3">
         <div>
           <h1 className="text-xl font-bold text-slate-800 leading-tight">Password Attack Simulation &amp; Detection Framework</h1>
           <p className="text-sm text-slate-500 mt-0.5">Simulate controlled attacks. Detect malicious activity. Analyze patterns.</p>
         </div>
-        <div className="flex items-center gap-1.5 text-[11px] text-slate-400 shrink-0 mt-1">
-          <Calendar size={12} />
-          <span>{new Date().toLocaleString()}</span>
+        <div className="flex items-center gap-2 shrink-0 mt-1">
+          {canSendTestAlert && (
+            <button
+              onClick={sendTestAlert}
+              disabled={testAlertRunning}
+              className="px-3 py-1.5 rounded-lg text-[11px] font-semibold border border-amber-200 bg-amber-50 text-amber-700 hover:bg-amber-100 disabled:opacity-60 transition"
+            >
+              {testAlertRunning ? "Sending..." : "Send Test Security Alert"}
+            </button>
+          )}
+          <div className="flex items-center gap-1.5 text-[11px] text-slate-400 shrink-0 mt-1">
+            <Calendar size={12} />
+            <span>{new Date().toLocaleString()}</span>
+          </div>
         </div>
       </div>
 
@@ -934,13 +980,49 @@ const PasswordSprayScreen = () => {
   const [results, setResults] = useState<any[] | null>(null);
   const [toast, setToast] = useState<{ msg: string; type: "success" | "error" | "info" } | null>(null);
 
+  useEffect(() => {
+    const unSubInit = wsEvents.on("simulation.initialized", () => {
+      setPct(0);
+    });
+    const unSubProg = wsEvents.on("simulation.progress", (data) => {
+      if (data.progress !== undefined) {
+        setPct(data.progress);
+      }
+    });
+    const unSubComp = wsEvents.on("simulation.completed", (data) => {
+      setPct(100);
+      setRunning(false);
+      if (data.events) {
+        const rows = data.events.map(formatEventRow);
+        setResults(rows);
+        setToast({ msg: `Password Spray completed — ${rows.length} events recorded`, type: "success" });
+        window.setTimeout(() => setToast(null), 4000);
+      }
+    });
+    const unSubFail = wsEvents.on("simulation.failed", (data) => {
+      setRunning(false);
+      setToast({ msg: data.error || "Simulation failed", type: "error" });
+    });
+    const unSubReset = wsEvents.on("simulations.reset", () => {
+      setResults(null);
+      setPct(0);
+    });
+    return () => {
+      unSubInit();
+      unSubProg();
+      unSubComp();
+      unSubFail();
+      unSubReset();
+    };
+  }, []);
+
   const run = async () => {
     setRunning(true);
-    setPct(20);
+    setPct(0);
     setResults(null);
     try {
       const attempts = Number(cfg.accounts) || 50;
-      const response = await apiFetch("/api/simulations/password-spray", {
+      await apiFetch("/api/simulations/password-spray", {
         method: "POST",
         body: JSON.stringify({
           name: "Password Spray Simulation",
@@ -953,16 +1035,20 @@ const PasswordSprayScreen = () => {
           source_ips: cfg.rotateIPs ? ["198.51.100.23", "203.0.113.45", "10.0.0.5"] : ["198.51.100.23"],
         }),
       });
-      const rows = (response.events ?? []).map(formatEventRow);
-      setResults(rows);
-      setPct(100);
-      setToast({ msg: `Password Spray completed — ${rows.length} events recorded`, type: "success" });
-      window.setTimeout(() => setToast(null), 4000);
     } catch (error) {
       setToast({ msg: error instanceof Error ? error.message : "Simulation failed", type: "error" });
-    } finally {
       setRunning(false);
-      window.setTimeout(() => setPct(0), 700);
+    }
+  };
+
+  const handleReset = async () => {
+    try {
+      await apiFetch("/api/simulations/reset", { method: "DELETE" });
+      setResults(null);
+      setPct(0);
+      setToast({ msg: "Simulation data reset successfully", type: "info" });
+    } catch (err) {
+      setToast({ msg: err instanceof Error ? err.message : "Reset failed", type: "error" });
     }
   };
 
@@ -972,8 +1058,7 @@ const PasswordSprayScreen = () => {
         title="Password Spray Attack"
         subtitle="Simulate a single password across multiple target accounts to test lockout and detection policies"
         actions={<>
-          <Btn variant="outline" size="sm"><Download size={12} />Export Config</Btn>
-          <Btn variant="outline" size="sm"><RefreshCw size={12} />Reset</Btn>
+          <Btn variant="outline" size="sm" onClick={handleReset}><RefreshCw size={12} />Reset</Btn>
         </>}
       />
       <div className="grid grid-cols-3 gap-5">
@@ -1011,7 +1096,7 @@ const PasswordSprayScreen = () => {
                 <ProgressBar value={pct} color="bg-blue-500" />
                 <div className="flex justify-between text-[11px] text-blue-400 mt-1.5">
                   <span>Attempted {Math.round(parseInt(cfg.accounts) * pct / 100)} / {cfg.accounts} accounts</span>
-                  <span>~{Math.ceil((100 - pct) * 0.12)}s remaining</span>
+                  <span>{pct === 100 ? "Completed" : "Processing real-time WebSocket events..."}</span>
                 </div>
               </div>
             )}
@@ -1029,7 +1114,7 @@ const PasswordSprayScreen = () => {
             <div className="bg-white rounded-xl border border-slate-200 shadow-sm">
               <div className="px-5 py-4 border-b border-slate-100 flex items-center justify-between">
                 <p className="font-semibold text-slate-800 text-sm flex items-center gap-2">
-                  <CheckCircle size={14} className="text-emerald-500" />Simulation Results
+                  <CheckCircle size={14} className="text-emerald-500" />Simulation Results ({results.length} events)
                 </p>
                 <Btn variant="outline" size="sm"><Download size={11} />Export CSV</Btn>
               </div>
@@ -1062,15 +1147,14 @@ const PasswordSprayScreen = () => {
             <p className="font-semibold text-slate-700 text-sm mb-3">Attack Preview</p>
             <div className="space-y-2.5">
               {[
-                { label: "Targets", value: `${cfg.accounts} accounts` },
-                { label: "Password", value: cfg.password },
-                { label: "Delay", value: `${cfg.delay}s between attempts` },
-                { label: "IP Rotation", value: cfg.rotateIPs ? "Enabled" : "Disabled" },
-                { label: "Est. Duration", value: `~${Math.max(1, Math.round(parseInt(cfg.accounts || "50") * parseInt(cfg.delay || "2") / 60))} min` },
+                { label: "Target Accounts", value: `${cfg.accounts} accounts` },
+                { label: "Sprayed Password", value: cfg.password ? "••••••••" : "Default" },
+                { label: "IP Rotation", value: cfg.rotateIPs ? "Enabled (3 IPs)" : "Disabled" },
+                { label: "Delay", value: `${cfg.delay}s per attempt` },
               ].map(s => (
-                <div key={s.label} className="flex justify-between text-sm border-b border-slate-50 pb-2 last:border-0 last:pb-0">
+                <div key={s.label} className="flex justify-between text-sm border-b border-slate-50 pb-2 last:border-0">
                   <span className="text-slate-500">{s.label}</span>
-                  <span className="font-semibold text-slate-700 font-mono text-[12px]">{s.value}</span>
+                  <span className="font-semibold text-slate-700 font-mono text-[12px] truncate max-w-[130px]">{s.value}</span>
                 </div>
               ))}
             </div>
@@ -1094,49 +1178,104 @@ const PasswordSprayScreen = () => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const CredentialStuffingScreen = () => {
-  const [maxAttempts, setMaxAttempts] = useState("500");
+  const [maxAttempts, setMaxAttempts] = useState("50");
   const [concurrency, setConcurrency] = useState("10");
-  const [fileName] = useState("creds_list.txt");
+  const [datasetId, setDatasetId] = useState<string | null>(null);
+  const [datasetMeta, setDatasetMeta] = useState<{
+    filename: string;
+    total_rows: number;
+    valid_credentials: number;
+    invalid_rows: number;
+    duplicate_rows: number;
+  } | null>(null);
+  const [uploading, setUploading] = useState(false);
   const [running, setRunning] = useState(false);
   const [pct, setPct] = useState(0);
   const [results, setResults] = useState<any[] | null>(null);
   const [toast, setToast] = useState<{ msg: string; type: "success" | "error" | "info" } | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    const unSubInit = wsEvents.on("simulation.initialized", () => setPct(0));
+    const unSubProg = wsEvents.on("simulation.progress", (data) => {
+      if (data.progress !== undefined) setPct(data.progress);
+    });
+    const unSubComp = wsEvents.on("simulation.completed", (data) => {
+      setPct(100);
+      setRunning(false);
+      if (data.events) {
+        const rows = data.events.map(formatEventRow);
+        setResults(rows);
+        setToast({ msg: `Credential Stuffing completed — ${rows.length} events analyzed`, type: "info" });
+        window.setTimeout(() => setToast(null), 4000);
+      }
+    });
+    const unSubFail = wsEvents.on("simulation.failed", (data) => {
+      setRunning(false);
+      setToast({ msg: data.error || "Simulation failed", type: "error" });
+    });
+    const unSubReset = wsEvents.on("simulations.reset", () => {
+      setResults(null);
+      setPct(0);
+    });
+    return () => {
+      unSubInit();
+      unSubProg();
+      unSubComp();
+      unSubFail();
+      unSubReset();
+    };
+  }, []);
+
+  const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setUploading(true);
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      const res = await apiFetch("/api/simulations/upload-credentials", {
+        method: "POST",
+        body: formData,
+      });
+      setDatasetId(res.dataset_id);
+      setDatasetMeta(res);
+      setMaxAttempts(String(res.valid_credentials));
+      setToast({
+        msg: `Uploaded ${res.filename}: ${res.valid_credentials} valid credentials ready`,
+        type: "success",
+      });
+    } catch (err) {
+      setToast({ msg: err instanceof Error ? err.message : "Failed to upload CSV", type: "error" });
+    } finally {
+      setUploading(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  };
 
   const run = async () => {
     setRunning(true);
-    setPct(18);
+    setPct(0);
     setResults(null);
     try {
       const attempts = Number(maxAttempts) || 50;
-      const payload = {
+      const payload: any = {
         name: "Credential Stuffing Attack",
         source_ip: "185.199.110.24",
         attempts,
-        account_count: attempts,
-        delay_seconds: Math.max(0, Number(concurrency) ? 0.1 : 0),
+        delay_seconds: Math.max(0, Number(concurrency) ? 0.05 : 0),
         attack_pattern: "credential_stuffing",
-        credentials: Array.from({ length: attempts }, (_, index) => ({
-          username: `user${String(index + 1).padStart(3, "0")}@lab.local`,
-          password: `Password${index + 1}!`,
-        })),
       };
-      const response = await apiFetch("/api/simulations/credential-stuffing", {
+      if (datasetId) {
+        payload.dataset_id = datasetId;
+      }
+      await apiFetch("/api/simulations/credential-stuffing", {
         method: "POST",
         body: JSON.stringify(payload),
       });
-      setPct(100);
-      const rows = (response.events ?? []).map(formatEventRow);
-      setResults(rows);
-      setToast({
-        msg: `Credential Stuffing completed — ${rows.length} login events analyzed`,
-        type: "info",
-      });
-      window.setTimeout(() => setToast(null), 4000);
     } catch (error) {
       setToast({ msg: error instanceof Error ? error.message : "Simulation failed", type: "error" });
-    } finally {
       setRunning(false);
-      window.setTimeout(() => setPct(0), 700);
     }
   };
 
@@ -1155,10 +1294,23 @@ const CredentialStuffingScreen = () => {
             <div className="grid grid-cols-2 gap-4 mb-4">
               <div>
                 <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-wide mb-1.5">Credential List (CSV/TXT)</label>
-                <div className="border-2 border-dashed border-slate-200 rounded-lg p-5 text-center hover:border-blue-300 hover:bg-blue-50/20 transition cursor-pointer">
-                  <Upload size={18} className="text-slate-300 mx-auto mb-1.5" />
-                  <p className="text-[13px] text-slate-500 font-medium">{fileName}</p>
-                  <p className="text-[10px] text-slate-400 mt-0.5">2,500 credentials loaded • Click to change</p>
+                <input type="file" ref={fileInputRef} accept=".csv,.txt" className="hidden" onChange={handleFileSelect} />
+                <div
+                  onClick={() => fileInputRef.current?.click()}
+                  className="border-2 border-dashed border-slate-200 rounded-lg p-5 text-center hover:border-blue-300 hover:bg-blue-50/20 transition cursor-pointer"
+                >
+                  <Upload size={18} className="text-slate-400 mx-auto mb-1.5" />
+                  <p className="text-[13px] text-slate-700 font-semibold">
+                    {uploading ? "Uploading & parsing CSV..." : datasetMeta ? datasetMeta.filename : "Select Credential List (CSV/TXT)"}
+                  </p>
+                  {datasetMeta ? (
+                    <div className="text-[10px] text-slate-500 mt-1 space-y-0.5">
+                      <span className="text-emerald-600 font-bold">{datasetMeta.valid_credentials} valid credentials</span> •{" "}
+                      <span>{datasetMeta.invalid_rows} invalid</span> • <span>{datasetMeta.duplicate_rows} duplicates</span>
+                    </div>
+                  ) : (
+                    <p className="text-[10px] text-slate-400 mt-0.5">Click to upload email,password dataset file</p>
+                  )}
                 </div>
               </div>
               <div className="space-y-3">
@@ -1187,7 +1339,7 @@ const CredentialStuffingScreen = () => {
           {results && (
             <div className="bg-white rounded-xl border border-slate-200 shadow-sm">
               <div className="px-5 py-4 border-b border-slate-100 flex items-center justify-between">
-                <p className="font-semibold text-slate-800 text-sm">Simulation Results</p>
+                <p className="font-semibold text-slate-800 text-sm">Simulation Results ({results.length} events)</p>
                 <Btn variant="outline" size="sm"><Download size={11} />Export</Btn>
               </div>
               <table className="w-full text-sm">
@@ -1412,26 +1564,36 @@ const AttackHistoryScreen = () => {
   const [search, setSearch] = useState("");
   const [rows, setRows] = useState<any[]>([]);
 
+  const loadHistory = async () => {
+    try {
+      const simulations = await apiFetch("/api/simulations");
+      const items = (simulations ?? []).map((sim: any) => ({
+        id: sim.id,
+        type: formatAttackType(sim.attack_type ?? "normal"),
+        startTime: sim.created_at ? new Date(sim.created_at).toLocaleString() : "—",
+        duration: sim.completed_at
+          ? `${Math.max(1, Math.round((new Date(sim.completed_at).getTime() - new Date(sim.created_at).getTime()) / 1000))}s`
+          : "In Progress",
+        attempts: sim.attempts ?? 0,
+        sourceIP: sim.source_ip,
+        affectedCount: sim.affected_accounts?.length ?? 0,
+        status: sim.status ?? "completed",
+        blocked: sim.status === "completed",
+      }));
+      setRows(items);
+    } catch (error) {
+      console.error(error);
+    }
+  };
+
   useEffect(() => {
-    const load = async () => {
-      try {
-        const response = await apiFetch("/api/login-events?page=1&page_size=200");
-        const items = (response.items ?? []).map((event: any) => ({
-          id: event.id,
-          type: formatAttackType(event.attack_type ?? "normal"),
-          startTime: event.timestamp ? new Date(event.timestamp).toLocaleString() : "—",
-          duration: "—",
-          attempts: 1,
-          sourceIP: event.source_ip,
-          status: event.risk_score >= 70 ? "detected" : "completed",
-          blocked: Boolean(event.blocked),
-        }));
-        setRows(items);
-      } catch (error) {
-        console.error(error);
-      }
+    loadHistory();
+    const unSubComp = wsEvents.on("simulation.completed", () => loadHistory());
+    const unSubReset = wsEvents.on("simulations.reset", () => loadHistory());
+    return () => {
+      unSubComp();
+      unSubReset();
     };
-    load();
   }, []);
 
   const filtered = rows.filter((a) =>
@@ -1478,7 +1640,7 @@ const AttackHistoryScreen = () => {
                   <td className="px-5 py-3 font-semibold text-slate-700">{row.attempts}</td>
                   <td className="px-5 py-3 font-mono text-[12px] text-slate-500">{row.sourceIP}</td>
                   <td className="px-5 py-3">
-                    <span className={`px-2 py-0.5 rounded text-[11px] font-semibold border ${row.status === "detected" ? "bg-red-50 text-red-600 border-red-200" : "bg-emerald-50 text-emerald-600 border-emerald-200"}`}>
+                    <span className={`px-2 py-0.5 rounded text-[11px] font-semibold border ${row.status === "failed" ? "bg-red-50 text-red-600 border-red-200" : "bg-emerald-50 text-emerald-600 border-emerald-200"}`}>
                       {row.status.charAt(0).toUpperCase() + row.status.slice(1)}
                     </span>
                   </td>
@@ -1493,18 +1655,10 @@ const AttackHistoryScreen = () => {
                 </tr>
               ))}
               {filtered.length === 0 && (
-                <tr><td colSpan={8} className="px-5 py-12 text-center text-sm text-slate-400">No matching records found</td></tr>
+                <tr><td colSpan={8} className="px-5 py-12 text-center text-sm text-slate-400">No simulation history found</td></tr>
               )}
             </tbody>
           </table>
-        </div>
-        <div className="px-5 py-3 border-t border-slate-100 flex items-center justify-between">
-          <p className="text-[11px] text-slate-400">Showing {filtered.length} attacks</p>
-          <div className="flex items-center gap-1">
-            {[1, 2, 3].map(p => (
-              <button key={p} className={`w-7 h-7 rounded text-xs font-medium ${p === 1 ? "bg-blue-600 text-white" : "text-slate-500 hover:bg-slate-100"}`}>{p}</button>
-            ))}
-          </div>
         </div>
       </div>
     </div>
@@ -1521,6 +1675,16 @@ const LiveMonitoringScreen = () => {
   const [filter, setFilter] = useState("All");
 
   useEffect(() => {
+    const unSub = wsEvents.on("login_event", (data) => {
+      if (data.event && !paused) {
+        const row = formatEventRow(data.event);
+        setFeed(prev => [row, ...prev.filter(r => r.id !== row.id)].slice(0, 100));
+      }
+    });
+    return () => unSub();
+  }, [paused]);
+
+  useEffect(() => {
     if (paused) return;
     let active = true;
     const load = async () => {
@@ -1528,13 +1692,20 @@ const LiveMonitoringScreen = () => {
         const data = await apiFetch("/api/dashboard");
         if (!active) return;
         const rows = (data.liveFeed ?? []).map(formatEventRow);
-        setFeed(rows.length ? rows : seedFeed);
+        if (rows.length) {
+          setFeed(prev => {
+            const map = new Map();
+            rows.forEach((r: any) => map.set(r.id, r));
+            prev.forEach(r => map.set(r.id, r));
+            return Array.from(map.values()).slice(0, 100);
+          });
+        }
       } catch (error) {
         console.error(error);
       }
     };
     load();
-    const iv = window.setInterval(load, 2000);
+    const iv = window.setInterval(load, 3000);
     return () => {
       active = false;
       window.clearInterval(iv);
@@ -1547,7 +1718,7 @@ const LiveMonitoringScreen = () => {
     <div className="space-y-5">
       <SectionHeader
         title="Live Monitoring"
-        subtitle="Real-time authentication activity — auto-refreshes every 2 seconds"
+        subtitle="Real-time authentication activity via WebSocket live stream"
         actions={
           <button
             onClick={() => setPaused(p => !p)}
@@ -1574,7 +1745,7 @@ const LiveMonitoringScreen = () => {
         <div className="px-5 py-4 border-b border-slate-100 flex items-center justify-between">
           <div className="flex items-center gap-2">
             <span className={`w-2 h-2 rounded-full ${paused ? "bg-slate-400" : "bg-emerald-500 animate-pulse"}`} />
-            <span className="font-semibold text-slate-800 text-sm">{paused ? "Feed Paused" : "Live Feed"}</span>
+            <span className="font-semibold text-slate-800 text-sm">{paused ? "Feed Paused" : "Live Feed (WebSocket)"}</span>
             {!paused && <span className="text-[11px] text-slate-400">{feed.length} events captured</span>}
           </div>
           <select value={filter} onChange={e => setFilter(e.target.value)} className="text-[12px] text-slate-600 bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 outline-none">
@@ -1621,16 +1792,33 @@ const AlertsScreen = () => {
   const [selected, setSelected] = useState<any | null>(null);
 
   const load = async () => {
-    const data = await apiFetch("/api/alerts");
-    setAlerts(data);
-    if (selected) {
-      const refreshed = data.find((alert: any) => alert.id === selected.id);
-      if (refreshed) setSelected(refreshed);
+    try {
+      const data = await apiFetch("/api/alerts");
+      setAlerts(data);
+      if (selected) {
+        const refreshed = data.find((alert: any) => alert.id === selected.id);
+        if (refreshed) setSelected(refreshed);
+      }
+    } catch (err) {
+      console.error(err);
     }
   };
 
   useEffect(() => {
-    load().catch(console.error);
+    load();
+    const unSub = wsEvents.on("alert_created", (data) => {
+      if (data.alert) {
+        setAlerts(prev => [data.alert, ...prev.filter(a => a.id !== data.alert.id)]);
+      }
+    });
+    const unSubReset = wsEvents.on("simulations.reset", () => {
+      setAlerts([]);
+      setSelected(null);
+    });
+    return () => {
+      unSub();
+      unSubReset();
+    };
   }, []);
 
   const ack = async (id: string) => {
@@ -1681,6 +1869,7 @@ const AlertsScreen = () => {
                         <div className="flex items-center gap-2 mb-0.5 flex-wrap">
                           <span className="font-semibold text-slate-800 text-sm">{alert.attack_type}</span>
                           <SeverityBadge severity={alert.severity} />
+                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 text-slate-600 font-mono">Simulation Activity</span>
                         </div>
                         <p className="text-[12px] text-slate-500">{alert.explanation}</p>
                         <p className="text-[11px] text-slate-400 mt-1">{alert.timestamp ? new Date(alert.timestamp).toLocaleString() : ""}</p>
@@ -2513,16 +2702,20 @@ const SettingsScreen = () => {
 export default function App() {
   const [screen, setScreen] = useState<Screen>("dashboard");
   const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [currentRole, setCurrentRole] = useState<string | null>(null);
   const [authReady, setAuthReady] = useState(!isFirebaseConfigured);
   const [authError, setAuthError] = useState<string | null>(null);
   const [loginEmail, setLoginEmail] = useState("");
   const [loginPassword, setLoginPassword] = useState("");
   const [loginBusy, setLoginBusy] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
+  const pushTokenRef = useRef<string | null>(null);
+  const pushCleanupRef = useRef<(() => void) | null>(null);
 
   useEffect(() => {
     if (!auth || !isFirebaseConfigured) {
       setAccessToken(DEV_AUTH_TOKEN);
+      setCurrentRole("admin");
       setAuthReady(true);
       return;
     }
@@ -2531,10 +2724,24 @@ export default function App() {
       if (user) {
         // Force a fresh ID token so newly assigned Firebase custom claims
         // (for example `role: "admin"`) are included immediately after sign-in.
-        const token = await user.getIdToken(true).catch(() => "");
-        setAccessToken(token);
+        const tokenResult = await user.getIdTokenResult(true).catch(() => null);
+        if (tokenResult) {
+          setAccessToken(tokenResult.token);
+          setCurrentRole(typeof tokenResult.claims.role === "string" ? tokenResult.claims.role : null);
+        } else {
+          const token = await user.getIdToken(true).catch(() => "");
+          setAccessToken(token);
+          setCurrentRole(null);
+        }
+        try {
+          const profile = await apiFetch("/api/me");
+          setCurrentRole(typeof profile?.role === "string" ? profile.role : null);
+        } catch {
+          setCurrentRole(null);
+        }
       } else {
         clearAccessToken();
+        setCurrentRole(null);
       }
       setAuthReady(true);
     });
@@ -2542,14 +2749,71 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (!currentUser || !isFirebaseConfigured || !firebaseApp || !FIREBASE_VAPID_KEY) return;
+    if (typeof window === "undefined" || !("Notification" in window) || !("serviceWorker" in navigator)) return;
+    let cancelled = false;
+
+    const setupPushNotifications = async () => {
+      const supported = await isMessagingSupported().catch(() => false);
+      if (!supported || cancelled) return;
+      if (Notification.permission === "default") {
+        try {
+          await Notification.requestPermission();
+        } catch {
+          return;
+        }
+      }
+      if (Notification.permission !== "granted" || cancelled) return;
+
+      try {
+        const registration = await navigator.serviceWorker.register(buildMessagingWorkerUrl(), { scope: "/" });
+        const messaging = getMessaging(firebaseApp);
+        const token = await getToken(messaging, {
+          vapidKey: FIREBASE_VAPID_KEY,
+          serviceWorkerRegistration: registration,
+        });
+        if (!cancelled && token && token !== pushTokenRef.current) {
+          pushTokenRef.current = token;
+          await apiFetch("/api/notifications/register-token", {
+            method: "POST",
+            body: JSON.stringify({
+              token,
+              platform: "web",
+              device_name: navigator.userAgent,
+            }),
+          });
+        }
+        pushCleanupRef.current?.();
+        pushCleanupRef.current = onMessage(messaging, payload => {
+          const title = payload.notification?.title || "SecureAuth Alert";
+          const body = payload.notification?.body || "New security notification";
+          const data = payload.data ?? {};
+          if (Notification.permission === "granted") {
+            void registration.showNotification(title, {
+              body,
+              data,
+            });
+          }
+        });
+      } catch (error) {
+        console.error("Push notification setup failed", error);
+      }
+    };
+
+    void setupPushNotifications();
+    return () => {
+      cancelled = true;
+      pushCleanupRef.current?.();
+      pushCleanupRef.current = null;
+    };
+  }, [currentUser?.uid, authReady]);
+
+  useEffect(() => {
     const shouldConnect = isFirebaseConfigured ? Boolean(currentUser) : Boolean(getAccessToken());
     if (!shouldConnect) return;
     let reconnectTimer: number | null = null;
     let closed = false;
     const connect = async () => {
-      // Obtain a fresh ID token on every connect attempt.
-      // user.getIdToken(false) lets the Firebase SDK auto-refresh silently
-      // if the token is within 5 min of expiry, preventing 401s after 1 hour.
       let token: string;
       if (currentUser && isFirebaseConfigured) {
         token = await currentUser.getIdToken(false).catch(() => getAccessToken());
@@ -2560,13 +2824,25 @@ export default function App() {
       if (!token) return;
       const socket = new WebSocket(wsUrl(`/ws/live?token=${encodeURIComponent(token)}`));
       wsRef.current = socket;
-      socket.onmessage = () => {
-        // The dashboard polls REST data; the websocket keeps the live channel warm.
+      socket.onopen = () => {
+        wsEvents.emit("ws_status", { status: "connected" });
+      };
+      socket.onmessage = (evt) => {
+        try {
+          const message = JSON.parse(evt.data);
+          if (message && message.type) {
+            wsEvents.emit(message.type, message);
+          }
+        } catch (err) {
+          console.error("Failed to parse WebSocket message:", err);
+        }
       };
       socket.onerror = () => {
+        wsEvents.emit("ws_status", { status: "disconnected" });
         socket.close();
       };
       socket.onclose = () => {
+        wsEvents.emit("ws_status", { status: "disconnected" });
         if (!closed) reconnectTimer = window.setTimeout(connect, 2500);
       };
     };
@@ -2579,9 +2855,10 @@ export default function App() {
     };
   }, [currentUser, isFirebaseConfigured]);
 
+
   const renderScreen = () => {
     switch (screen) {
-      case "dashboard":          return <DashboardScreen onNav={setScreen} />;
+      case "dashboard":          return <DashboardScreen onNav={setScreen} canSendTestAlert={currentRole === "admin"} />;
       case "password-spray":     return <PasswordSprayScreen />;
       case "credential-stuffing":return <CredentialStuffingScreen />;
       case "custom-attack":      return <CustomAttackScreen />;
@@ -2594,7 +2871,7 @@ export default function App() {
       case "test-accounts":      return <TestAccountsScreen />;
       case "ip-controls":        return <IPControlsScreen />;
       case "settings":           return <SettingsScreen />;
-      default:                   return <DashboardScreen onNav={setScreen} />;
+      default:                   return <DashboardScreen onNav={setScreen} canSendTestAlert={currentRole === "admin"} />;
     }
   };
 
@@ -2616,11 +2893,25 @@ export default function App() {
   };
 
   const handleLogout = async () => {
+    if (pushTokenRef.current) {
+      try {
+        await apiFetch("/api/notifications/token", {
+          method: "DELETE",
+          body: JSON.stringify({ token: pushTokenRef.current }),
+        });
+      } catch (error) {
+        console.error("Failed to unregister push token", error);
+      }
+    }
     if (auth && isFirebaseConfigured) {
       await signOut(auth);
     }
+    pushCleanupRef.current?.();
+    pushCleanupRef.current = null;
     clearAccessToken();
     setCurrentUser(null);
+    setCurrentRole(null);
+    pushTokenRef.current = null;
   };
 
   if (!authReady) {

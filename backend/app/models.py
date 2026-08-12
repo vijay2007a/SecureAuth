@@ -192,9 +192,41 @@ class AuthenticatedUser(BaseModel):
     token_source: str = "firebase"
 
 
+class NotificationTokenRecord(BaseModel):
+    id: str
+    uid: str
+    email: str
+    token: str
+    platform: str = "web"
+    device_name: str = "Browser"
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+    last_seen_at: Optional[datetime] = None
+
+
+class CredentialDataset(BaseModel):
+    id: str
+    filename: str
+    total_rows: int
+    valid_credentials: int
+    invalid_rows: int
+    duplicate_rows: int
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class DatasetUploadResponse(BaseModel):
+    filename: str
+    total_rows: int
+    valid_credentials: int
+    invalid_rows: int
+    duplicate_rows: int
+    dataset_id: str
+
+
 class SimulationRequest(BaseModel):
     name: str | None = None
     source_ip: str
+    target_email: str | None = None
     attempts: int = Field(ge=1, le=5000)
     delay_seconds: float = Field(default=0.0, ge=0.0, le=10.0)
     account_count: int | None = Field(default=None, ge=1, le=5000)
@@ -203,7 +235,9 @@ class SimulationRequest(BaseModel):
     passwords: list[str] = Field(default_factory=list)
     source_ips: list[str] = Field(default_factory=list)
     credentials: list[dict[str, str]] = Field(default_factory=list)
+    dataset_id: str | None = None
     rotate_ips: bool = False
+
 
 
 class AccountCreateRequest(BaseModel):
@@ -237,6 +271,16 @@ class IPControlUpdateRequest(BaseModel):
 
 class AlertUpdateRequest(BaseModel):
     status: AlertStatus
+
+
+class NotificationTokenRequest(BaseModel):
+    token: str = Field(min_length=16, max_length=4096)
+    device_name: str | None = None
+    platform: str = "web"
+
+
+class NotificationTokenDeleteRequest(BaseModel):
+    token: str = Field(min_length=16, max_length=4096)
 
 
 class SettingsPayload(BaseModel):

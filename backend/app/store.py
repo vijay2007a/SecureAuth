@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import threading
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -12,11 +13,13 @@ from .models import (
     AccountStatus,
     AlertRecord,
     AlertStatus,
+    CredentialDataset,
     IPControl,
     IPControlType,
     LoginEvent,
     ModelMetric,
     ReportRecord,
+    NotificationTokenRecord,
     Role,
     SimulationRecord,
     SimulationStatus,
@@ -41,6 +44,10 @@ def _parse_dt(value: Any) -> Optional[datetime]:
     if isinstance(value, datetime):
         return value
     return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+
+
+def _notification_token_id(uid: str, token: str) -> str:
+    return hashlib.sha256(f"{uid}:{token}".encode("utf-8")).hexdigest()
 
 
 class BaseStore:
@@ -86,6 +93,15 @@ class BaseStore:
     def update_alert(self, alert_id: str, **patch: Any) -> Optional[AlertRecord]:
         raise NotImplementedError
 
+    def list_notification_tokens(self, uid: str | None = None) -> list[NotificationTokenRecord]:
+        raise NotImplementedError
+
+    def upsert_notification_token(self, token: NotificationTokenRecord) -> NotificationTokenRecord:
+        raise NotImplementedError
+
+    def delete_notification_token(self, uid: str, token: str) -> bool:
+        raise NotImplementedError
+
     def list_simulations(self) -> list[SimulationRecord]:
         raise NotImplementedError
 
@@ -110,6 +126,18 @@ class BaseStore:
     def set_thresholds(self, thresholds: Thresholds) -> Thresholds:
         raise NotImplementedError
 
+    def store_credentials(self, dataset_id: str, credentials: list[dict[str, str]], metadata: CredentialDataset) -> CredentialDataset:
+        raise NotImplementedError
+
+    def get_credentials(self, dataset_id: str) -> Optional[list[dict[str, str]]]:
+        raise NotImplementedError
+
+    def get_dataset_metadata(self, dataset_id: str) -> Optional[CredentialDataset]:
+        raise NotImplementedError
+
+    def clear_simulation_data(self) -> dict[str, int]:
+        raise NotImplementedError
+
 
 class MemoryStore(BaseStore):
     def __init__(self) -> None:
@@ -119,11 +147,14 @@ class MemoryStore(BaseStore):
         self._ips: dict[str, IPControl] = {}
         self._events: dict[str, LoginEvent] = {}
         self._alerts: dict[str, AlertRecord] = {}
+        self._notification_tokens: dict[str, NotificationTokenRecord] = {}
         self._simulations: dict[str, SimulationRecord] = {}
         self._models: dict[str, ModelMetric] = {}
         self._reports: dict[str, ReportRecord] = {}
+        self._datasets: dict[str, tuple[CredentialDataset, list[dict[str, str]]]] = {}
         self._thresholds = Thresholds()
         self._seed()
+
 
     def _seed(self) -> None:
         admin = UserProfile(id="admin-1", email="admin@lab.local", name="Lab Admin", role=Role.admin)
@@ -278,6 +309,47 @@ class MemoryStore(BaseStore):
             self._alerts[alert_id] = updated
             return updated
 
+    def list_notification_tokens(self, uid: str | None = None) -> list[NotificationTokenRecord]:
+        tokens = list(self._notification_tokens.values())
+        if uid:
+            tokens = [item for item in tokens if item.uid == uid]
+        return sorted(tokens, key=lambda item: item.updated_at, reverse=True)
+
+    def upsert_notification_token(self, token: NotificationTokenRecord) -> NotificationTokenRecord:
+        with self._lock:
+            existing_key = next(
+                (
+                    key
+                    for key, value in self._notification_tokens.items()
+                    if value.uid == token.uid and value.token == token.token
+                ),
+                None,
+            )
+            token.updated_at = utc_now()
+            token.last_seen_at = token.updated_at
+            if existing_key:
+                token.id = self._notification_tokens[existing_key].id
+                token.created_at = self._notification_tokens[existing_key].created_at
+                self._notification_tokens[existing_key] = token
+            else:
+                self._notification_tokens[token.id] = token
+        return token
+
+    def delete_notification_token(self, uid: str, token: str) -> bool:
+        with self._lock:
+            key = next(
+                (
+                    item_id
+                    for item_id, value in self._notification_tokens.items()
+                    if value.uid == uid and value.token == token
+                ),
+                None,
+            )
+            if not key:
+                return False
+            self._notification_tokens.pop(key, None)
+            return True
+
     def list_simulations(self) -> list[SimulationRecord]:
         return sorted(self._simulations.values(), key=lambda item: item.created_at, reverse=True)
 
@@ -309,6 +381,37 @@ class MemoryStore(BaseStore):
     def set_thresholds(self, thresholds: Thresholds) -> Thresholds:
         self._thresholds = thresholds
         return self._thresholds
+
+    def store_credentials(self, dataset_id: str, credentials: list[dict[str, str]], metadata: CredentialDataset) -> CredentialDataset:
+        with self._lock:
+            self._datasets[dataset_id] = (metadata, credentials)
+        return metadata
+
+    def get_credentials(self, dataset_id: str) -> Optional[list[dict[str, str]]]:
+        item = self._datasets.get(dataset_id)
+        return item[1] if item else None
+
+    def get_dataset_metadata(self, dataset_id: str) -> Optional[CredentialDataset]:
+        item = self._datasets.get(dataset_id)
+        return item[0] if item else None
+
+    def clear_simulation_data(self) -> dict[str, int]:
+        with self._lock:
+            events_count = len(self._events)
+            alerts_count = len(self._alerts)
+            sims_count = len(self._simulations)
+            self._events.clear()
+            self._alerts.clear()
+            self._simulations.clear()
+            for account in self._accounts.values():
+                account.attempts = 0
+                account.locked = False
+                account.status = AccountStatus.active
+            return {
+                "events_deleted": events_count,
+                "alerts_deleted": alerts_count,
+                "simulations_deleted": sims_count,
+            }
 
     def export_summary(self) -> dict[str, Any]:
         return {
@@ -416,6 +519,43 @@ class FirestoreStore(BaseStore):
         ref.set(payload, merge=True)
         return AlertRecord(id=alert_id, **payload)
 
+    def list_notification_tokens(self, uid: str | None = None) -> list[NotificationTokenRecord]:
+        docs = self._col("notification_tokens").stream()
+        tokens: list[NotificationTokenRecord] = []
+        for doc in docs:
+            payload = doc.to_dict() or {}
+            payload["id"] = doc.id
+            token = NotificationTokenRecord(**self._load_time_fields(payload, ["created_at", "updated_at", "last_seen_at"]))
+            if uid and token.uid != uid:
+                continue
+            tokens.append(token)
+        return sorted(tokens, key=lambda item: item.updated_at, reverse=True)
+
+    def upsert_notification_token(self, token: NotificationTokenRecord) -> NotificationTokenRecord:
+        payload = self._dump(token)
+        token.updated_at = utc_now()
+        token.last_seen_at = token.updated_at
+        doc_id = _notification_token_id(token.uid, token.token)
+        existing = self._col("notification_tokens").document(doc_id).get()
+        if existing.exists:
+            token.id = existing.id
+            payload = existing.to_dict() or {}
+            token.created_at = _parse_dt(payload.get("created_at")) or token.created_at
+        self._col("notification_tokens").document(doc_id).set(self._dump(token), merge=True)
+        return token
+
+    def delete_notification_token(self, uid: str, token: str) -> bool:
+        doc_id = _notification_token_id(uid, token)
+        ref = self._col("notification_tokens").document(doc_id)
+        snap = ref.get()
+        if not snap.exists:
+            return False
+        payload = snap.to_dict() or {}
+        if payload.get("uid") != uid:
+            return False
+        ref.delete()
+        return True
+
     def list_simulations(self) -> list[SimulationRecord]:
         return self._all("simulations", SimulationRecord)
 
@@ -447,4 +587,46 @@ class FirestoreStore(BaseStore):
     def set_thresholds(self, thresholds: Thresholds) -> Thresholds:
         self._col("settings").document("thresholds").set(thresholds.model_dump(mode="json"), merge=True)
         return thresholds
+
+    def store_credentials(self, dataset_id: str, credentials: list[dict[str, str]], metadata: CredentialDataset) -> CredentialDataset:
+        payload = {
+            "metadata": self._dump(metadata),
+            "credentials": credentials,
+            "created_at": utc_now().isoformat(),
+        }
+        self._col("credential_datasets").document(dataset_id).set(payload)
+        return metadata
+
+    def get_credentials(self, dataset_id: str) -> Optional[list[dict[str, str]]]:
+        snap = self._col("credential_datasets").document(dataset_id).get()
+        if not snap.exists:
+            return None
+        data = snap.to_dict() or {}
+        return data.get("credentials")
+
+    def get_dataset_metadata(self, dataset_id: str) -> Optional[CredentialDataset]:
+        snap = self._col("credential_datasets").document(dataset_id).get()
+        if not snap.exists:
+            return None
+        data = snap.to_dict() or {}
+        meta = data.get("metadata")
+        return CredentialDataset(**meta) if meta else None
+
+    def clear_simulation_data(self) -> dict[str, int]:
+        def _delete_col(col_name: str) -> int:
+            docs = list(self._col(col_name).stream())
+            count = 0
+            for doc in docs:
+                doc.reference.delete()
+                count += 1
+            return count
+
+        e_cnt = _delete_col("login_events")
+        a_cnt = _delete_col("alerts")
+        s_cnt = _delete_col("simulations")
+        return {
+            "events_deleted": e_cnt,
+            "alerts_deleted": a_cnt,
+            "simulations_deleted": s_cnt,
+        }
 

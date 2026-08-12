@@ -20,5 +20,4 @@ if (configured) {
   auth = getAuth(app);
 }
 
-export { app, auth, configured as isFirebaseConfigured };
-
+export { app, auth, config as firebaseConfig, configured as isFirebaseConfigured };
