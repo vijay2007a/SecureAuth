@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, Component } from "react";
 import {
   Shield, LayoutDashboard, Zap, Lock, Wrench, History,
   Activity, Bell, BarChart2, Brain, FileText, UserCheck,
@@ -163,6 +163,58 @@ const apiFetch = async (path: string, init: RequestInit = {}) => {
   if (response.status === 204) return null;
   return response.json();
 };
+
+interface ErrorBoundaryProps {
+  children: React.ReactNode;
+}
+
+interface ErrorBoundaryState {
+  hasError: boolean;
+  error: Error | null;
+}
+
+class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
+  constructor(props: ErrorBoundaryProps) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+
+  static getDerivedStateFromError(error: Error): ErrorBoundaryState {
+    return { hasError: true, error };
+  }
+
+  componentDidCatch(error: Error, errorInfo: React.ErrorInfo) {
+    console.error("Uncaught UI Error:", error, errorInfo);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="bg-white rounded-xl border border-red-200 shadow-sm p-6 max-w-xl mx-auto my-8">
+          <div className="flex items-center gap-3 mb-3">
+            <div className="w-10 h-10 rounded-lg bg-red-50 flex items-center justify-center text-red-600 font-bold shrink-0">
+              <AlertTriangle size={20} />
+            </div>
+            <div>
+              <h3 className="font-semibold text-slate-800 text-sm">Screen Render Error</h3>
+              <p className="text-xs text-slate-500">An error occurred while rendering this view.</p>
+            </div>
+          </div>
+          <div className="bg-slate-50 rounded-lg p-3 border border-slate-200 font-mono text-xs text-red-600 mb-4 overflow-x-auto">
+            {this.state.error?.message || "Unknown error"}
+          </div>
+          <button
+            onClick={() => this.setState({ hasError: false, error: null })}
+            className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-semibold text-xs transition"
+          >
+            Try Reloading Screen
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 
 const wsUrl = (path: string) => `${WS_BASE_URL}${path}`;
